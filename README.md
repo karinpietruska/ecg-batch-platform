@@ -38,11 +38,18 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 
 ---
 
-## Small testable steps
+## Current state & next extensions
 
-- **Step 1 (current):** Repo structure, Compose (Postgres + MinIO + bucket bootstrap), DB init, README. Validate with `docker compose up -d` and `docker compose ps`.
-- **Step 2:** Document data lake layout and partitioning; expand metadata usage as needed.
-- **Step 3+:** Add ingestion, then processing, then aggregation, then orchestrator (see implementation plan in the repo).
+**Current state:**
+
+- Infrastructure (Postgres + MinIO + bucket bootstrap) is operational.
+
+**Next extensions:**
+
+- Add ingestion service (raw layer writes)
+- Add processing service (RR extraction)
+- Add aggregation service (HRV features)
+- Add batch orchestrator
 
 ---
 
@@ -62,13 +69,33 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 ├── docker-compose.yml      # System entrypoint: Postgres + MinIO + bootstrap
 ├── .env.example            # Example env vars (copy to .env)
 ├── docker/
-│   └── postgres/
+│   └── 
+## Dataset (for later steps)
+
+For ingestion with real data: download the MIT-BIH Arrhythmia Database into a local folder and mount it into the ingestion container. Example:
+
+- Host path: `./data/mitdb` (gitignored)
+- Container: `/data/mitdb`
+## Dataset (for later steps)
+
+For ingestion with real data: download the MIT-BIH Arrhythmia Database into a local folder and mount it into the ingestion container. Example:
+
+- Host path: `./data/mitdb` (gitignored)
+- Container: `/data/mitdb`
+- Set `WFDB_LOCAL_DIR=/data/mitdb` when running ingestion.
+
+README will be updated when the ingestion service is added.
+
+- Set `WFDB_LOCAL_DIR=/data/mitdb` when running ingestion.
+
+README will be updated when the ingestion service is added.
+postgres/
 │       └── init.sql        # Metadata schema (runs, artifacts, quality_metrics)
 ├── services/
-│   ├── ingestion/          # Step 3
-│   ├── processing/         # Step 4
-│   └── aggregation/       # Step 5
-├── orchestrator/           # Step 6
+│   ├── ingestion/          # Layer 1 – raw data ingestion
+│   ├── processing/         # Layer 1 – signal processing (RR extraction)
+│   └── aggregation/        # Layer 1 – feature computation (Spark)
+├── orchestrator/           # Layer 0 – batch run coordination
 └── scripts/                # Optional utilities
 ```
 
