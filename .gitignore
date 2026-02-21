@@ -31,9 +31,9 @@ tmp/
 local/
 
 # =====================================================
-# Private working notes (do not commit)
+# Documentation (entire docs/ untracked for now)
 # =====================================================
-docs/project_requirements_checklist.md
+docs/
 
 
 # =====================================================
