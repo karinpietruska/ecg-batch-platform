@@ -69,27 +69,7 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 ├── docker-compose.yml      # System entrypoint: Postgres + MinIO + bootstrap
 ├── .env.example            # Example env vars (copy to .env)
 ├── docker/
-│   └── 
-## Dataset (for later steps)
-
-For ingestion with real data: download the MIT-BIH Arrhythmia Database into a local folder and mount it into the ingestion container. Example:
-
-- Host path: `./data/mitdb` (gitignored)
-- Container: `/data/mitdb`
-## Dataset (for later steps)
-
-For ingestion with real data: download the MIT-BIH Arrhythmia Database into a local folder and mount it into the ingestion container. Example:
-
-- Host path: `./data/mitdb` (gitignored)
-- Container: `/data/mitdb`
-- Set `WFDB_LOCAL_DIR=/data/mitdb` when running ingestion.
-
-README will be updated when the ingestion service is added.
-
-- Set `WFDB_LOCAL_DIR=/data/mitdb` when running ingestion.
-
-README will be updated when the ingestion service is added.
-postgres/
+│   └── postgres/
 │       └── init.sql        # Metadata schema (runs, artifacts, quality_metrics)
 ├── services/
 │   ├── ingestion/          # Layer 1 – raw data ingestion
