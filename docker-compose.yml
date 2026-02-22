@@ -49,6 +49,22 @@ services:
       "
     restart: "no"
 
+  ingestion:
+    build: ./services/ingestion
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUN_ID: ${RUN_ID:-}
+      RUN_DATE: ${RUN_DATE:-}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-ecg_metadata}
+      POSTGRES_USER: ${POSTGRES_USER:-ecg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    profiles:
+      - ingestion
+
 volumes:
   postgres_data:
   minio_data:
