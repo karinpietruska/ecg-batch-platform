@@ -30,3 +30,30 @@ CREATE TABLE IF NOT EXISTS quality_metrics (
     atr_exists  BOOLEAN,
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Unique business keys to prevent duplicate artifacts / QC rows
+CREATE UNIQUE INDEX IF NOT EXISTS ux_artifacts_business_key
+ON artifacts (run_id, record_id, layer, artifact_type);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_quality_metrics_business_key
+ON quality_metrics (run_id, record_id);
+
+-- Referential integrity: artifacts and quality_metrics must reference an existing run
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'fk_artifacts_run'
+  ) THEN
+    ALTER TABLE artifacts
+      ADD CONSTRAINT fk_artifacts_run
+      FOREIGN KEY (run_id) REFERENCES runs(run_id);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'fk_quality_metrics_run'
+  ) THEN
+    ALTER TABLE quality_metrics
+      ADD CONSTRAINT fk_quality_metrics_run
+      FOREIGN KEY (run_id) REFERENCES runs(run_id);
+  END IF;
+END $$;
