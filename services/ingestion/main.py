@@ -1,8 +1,8 @@
 """
-Ingestion service – Path B (v0.2)
+Ingestion service – Path B (v0.2) + Idempotency (C)
 
-Extends run registration by generating synthetic ECG data, writing one Parquet
-file to the raw layer in MinIO, and inserting one artifact + one QC row.
+Generates synthetic ECG, writes one Parquet to raw layer, upserts artifact + QC.
+If object already exists and INGEST_OVERWRITE=false, skips write and marks run succeeded.
 """
 import os
 import sys
@@ -15,6 +15,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
 
 # -----------------------------------------------------------------------------
 # Config from env (use service names inside Docker network)
@@ -37,6 +38,10 @@ AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
 RECORD_ID = os.environ.get("RECORD_ID", "synthetic_001")
 
+# Idempotency: if true, overwrite existing object and upsert metadata; if false, skip when object exists
+_OVERWRITE_RAW = (os.environ.get("INGEST_OVERWRITE", "false") or "false").strip().lower()
+INGEST_OVERWRITE = _OVERWRITE_RAW in ("1", "true", "yes", "y", "on")
+
 
 def log_structured(**kwargs):
     """Minimal structured log (key=value)."""
@@ -53,6 +58,30 @@ def validate_run_date(s: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def get_s3_client():
+    """S3 client for MinIO (use host minio in Docker network)."""
+    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+        raise RuntimeError("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set for MinIO access")
+    return boto3.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    )
+
+
+def object_exists(s3_client, bucket: str, key: str) -> bool:
+    """Return True if object exists; False if 404/NoSuchKey/NotFound; re-raise other errors."""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        code = str((e.response.get("Error") or {}).get("Code", "")).strip()
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
 
 
 def generate_synthetic_ecg(run_id: str, run_date: str, record_id: str):
@@ -87,17 +116,10 @@ def generate_synthetic_ecg(run_id: str, run_date: str, record_id: str):
     return table, fs, n_samples
 
 
-def upload_parquet_to_minio(table: pa.Table, bucket: str, key: str) -> None:
+def upload_parquet_to_minio(table: pa.Table, bucket: str, key: str, s3_client=None) -> None:
     """Write table to a temp Parquet file and upload to MinIO via boto3."""
-    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
-        raise RuntimeError("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set for MinIO access")
-
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=MINIO_ENDPOINT,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    )
+    if s3_client is None:
+        s3_client = get_s3_client()
 
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
         tmp_path = tmp.name
@@ -146,7 +168,7 @@ def main() -> int:
         cur.execute(
             """
             INSERT INTO runs (run_id, run_date, status, notes)
-            VALUES (%s, %s, 'running', 'ingestion v0.2 synthetic Path B')
+            VALUES (%s, %s, 'running', 'ingestion v0.2 + idempotency')
             ON CONFLICT (run_id) DO UPDATE SET
                 run_date = EXCLUDED.run_date,
                 status   = 'running',
@@ -156,29 +178,61 @@ def main() -> int:
         )
         conn.commit()
 
-        # Generate synthetic data and write one Parquet file to MinIO (raw layer)
-        table, fs, n_samples = generate_synthetic_ecg(run_id, run_date, RECORD_ID)
-
         object_key = (
             f"raw/run_date={run_date}/run_id={run_id}/"
             f"record_id={RECORD_ID}/ecg.parquet"
         )
 
-        upload_parquet_to_minio(table, MINIO_BUCKET, object_key)
+        # Idempotency: check before generating data (keep skip path fast)
+        s3_client = get_s3_client()
+        if object_exists(s3_client, MINIO_BUCKET, object_key):
+            if not INGEST_OVERWRITE:
+                log_structured(
+                    event="ingestion_skip",
+                    reason="object_exists",
+                    key=object_key,
+                    overwrite="false",
+                )
+                cur.execute(
+                    "UPDATE runs SET status = 'succeeded' WHERE run_id = %s",
+                    (run_id,),
+                )
+                conn.commit()
+                log_structured(
+                    event="ingestion_end",
+                    run_id=run_id,
+                    status="succeeded",
+                    skipped="true",
+                    overwrite="false",
+                )
+                return 0
+            # overwrite=true: fall through to upload + upsert
 
-        # Insert artifact + quality metrics
+        # Generate synthetic data and write one Parquet file to MinIO (raw layer)
+        table, fs, n_samples = generate_synthetic_ecg(run_id, run_date, RECORD_ID)
+        upload_parquet_to_minio(table, MINIO_BUCKET, object_key, s3_client=s3_client)
+
+        # Upsert artifact + quality_metrics (safe for overwrite re-runs)
         cur.execute(
             """
             INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
             VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, record_id, layer, artifact_type)
+            DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
             """,
             (run_id, RECORD_ID, "raw", "ecg", object_key, "raw_ecg_v1"),
         )
-
         cur.execute(
             """
             INSERT INTO quality_metrics (run_id, record_id, sampling_hz, n_samples, n_channels, atr_exists)
             VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, record_id)
+            DO UPDATE SET
+                sampling_hz = EXCLUDED.sampling_hz,
+                n_samples = EXCLUDED.n_samples,
+                n_channels = EXCLUDED.n_channels,
+                atr_exists = EXCLUDED.atr_exists,
+                created_at = NOW()
             """,
             (run_id, RECORD_ID, fs, n_samples, 2, False),
         )
@@ -192,7 +246,13 @@ def main() -> int:
         )
         conn.commit()
 
-        log_structured(event="ingestion_end", run_id=run_id, status="succeeded")
+        log_structured(
+            event="ingestion_end",
+            run_id=run_id,
+            status="succeeded",
+            skipped="false",
+            overwrite="true" if INGEST_OVERWRITE else "false",
+        )
         return 0
 
     except Exception as e:

@@ -66,6 +66,7 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-ecg-datalake}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      INGEST_OVERWRITE: ${INGEST_OVERWRITE:-false}
     profiles:
       - ingestion
 
