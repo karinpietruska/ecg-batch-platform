@@ -62,6 +62,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ecg_metadata}
       POSTGRES_USER: ${POSTGRES_USER:-ecg}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: ${MINIO_BUCKET:-ecg-datalake}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
     profiles:
       - ingestion
 
