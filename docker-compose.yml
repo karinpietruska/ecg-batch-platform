@@ -57,6 +57,9 @@ services:
     environment:
       RUN_ID: ${RUN_ID:-}
       RUN_DATE: ${RUN_DATE:-}
+      RECORD_IDS: ${RECORD_IDS:-}
+      RECORD_RANGE: ${RECORD_RANGE:-}
+      RECORD_LIMIT: ${RECORD_LIMIT:-}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB:-ecg_metadata}

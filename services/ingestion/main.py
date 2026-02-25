@@ -1,8 +1,8 @@
 """
-Ingestion service – Path B (v0.2) + Idempotency (C)
+Ingestion service – v0.3 multi-record synthetic
 
-Generates synthetic ECG, writes one Parquet to raw layer, upserts artifact + QC.
-If object already exists and INGEST_OVERWRITE=false, skips write and marks run succeeded.
+Supports RECORD_IDS / RECORD_RANGE; per-record idempotency; run status
+succeeded / partial_success / failed; fail-per-record with counts.
 """
 import os
 import sys
@@ -36,7 +36,10 @@ MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "ecg-datalake")
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
-RECORD_ID = os.environ.get("RECORD_ID", "synthetic_001")
+# Record list: RECORD_IDS wins over RECORD_RANGE; if neither, default to single synthetic record
+RECORD_IDS_RAW = os.environ.get("RECORD_IDS")
+RECORD_RANGE_RAW = os.environ.get("RECORD_RANGE")
+RECORD_LIMIT_RAW = os.environ.get("RECORD_LIMIT")  # optional, truncate for dev
 
 # Idempotency: if true, overwrite existing object and upsert metadata; if false, skip when object exists
 _OVERWRITE_RAW = (os.environ.get("INGEST_OVERWRITE", "false") or "false").strip().lower()
@@ -58,6 +61,47 @@ def validate_run_date(s: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def resolve_record_ids() -> list[str]:
+    """
+    Resolve record list from RECORD_IDS or RECORD_RANGE (RECORD_IDS wins).
+    If neither set, return ["synthetic_001"]. Apply RECORD_LIMIT if set.
+    Raises ValueError on parse failure.
+    """
+    if RECORD_IDS_RAW is not None and (RECORD_IDS_RAW or "").strip():
+        ids = [s.strip() for s in RECORD_IDS_RAW.split(",") if s.strip()]
+        if not ids:
+            raise ValueError("RECORD_IDS is empty or only separators")
+        record_ids = ids
+    elif RECORD_RANGE_RAW is not None and (RECORD_RANGE_RAW or "").strip():
+        s = RECORD_RANGE_RAW.strip()
+        if "-" not in s:
+            raise ValueError("RECORD_RANGE must be start-end (e.g. 100-124)")
+        parts = s.split("-", 1)
+        if len(parts) != 2:
+            raise ValueError("RECORD_RANGE must be start-end (e.g. 100-124)")
+        try:
+            start = int(parts[0].strip())
+            end = int(parts[1].strip())
+        except ValueError as e:
+            raise ValueError(f"RECORD_RANGE start/end must be integers: {e}") from e
+        if start > end:
+            raise ValueError(f"RECORD_RANGE start ({start}) must be <= end ({end})")
+        record_ids = [str(i) for i in range(start, end + 1)]
+    else:
+        record_ids = ["synthetic_001"]
+
+    if RECORD_LIMIT_RAW is not None and RECORD_LIMIT_RAW.strip():
+        try:
+            limit = int(RECORD_LIMIT_RAW.strip())
+        except ValueError as e:
+            raise ValueError(f"RECORD_LIMIT must be an integer: {e}") from e
+        if limit < 1:
+            raise ValueError("RECORD_LIMIT must be >= 1")
+        record_ids = record_ids[:limit]
+
+    return record_ids
 
 
 def get_s3_client():
@@ -168,7 +212,7 @@ def main() -> int:
         cur.execute(
             """
             INSERT INTO runs (run_id, run_date, status, notes)
-            VALUES (%s, %s, 'running', 'ingestion v0.2 + idempotency')
+            VALUES (%s, %s, 'running', 'ingestion v0.3 multi-record')
             ON CONFLICT (run_id) DO UPDATE SET
                 run_date = EXCLUDED.run_date,
                 status   = 'running',
@@ -178,82 +222,120 @@ def main() -> int:
         )
         conn.commit()
 
-        object_key = (
-            f"raw/run_date={run_date}/run_id={run_id}/"
-            f"record_id={RECORD_ID}/ecg.parquet"
-        )
+        # Resolve record list (after run exists so we can mark run failed on parse error)
+        try:
+            record_ids = resolve_record_ids()
+        except ValueError as e:
+            cur.execute(
+                "UPDATE runs SET status = 'failed', notes = %s WHERE run_id = %s",
+                (str(e)[:500], run_id),
+            )
+            conn.commit()
+            log_structured(
+                event="record_list_parse_failed",
+                run_id=run_id,
+                detail=str(e),
+            )
+            return 1
 
-        # Idempotency: check before generating data (keep skip path fast)
+        if not record_ids:
+            cur.execute(
+                "UPDATE runs SET status = 'failed', notes = %s WHERE run_id = %s",
+                ("record list empty", run_id),
+            )
+            conn.commit()
+            log_structured(
+                event="record_list_empty",
+                run_id=run_id,
+            )
+            return 1
+
         s3_client = get_s3_client()
-        if object_exists(s3_client, MINIO_BUCKET, object_key):
-            if not INGEST_OVERWRITE:
-                log_structured(
-                    event="ingestion_skip",
-                    reason="object_exists",
-                    key=object_key,
-                    overwrite="false",
+        records_ok = 0
+        records_skipped = 0
+        records_failed = 0
+
+        for record_id in record_ids:
+            object_key = (
+                f"raw/run_date={run_date}/run_id={run_id}/"
+                f"record_id={record_id}/ecg.parquet"
+            )
+
+            # Idempotency: check before generating data
+            if object_exists(s3_client, MINIO_BUCKET, object_key):
+                if not INGEST_OVERWRITE:
+                    log_structured(
+                        event="ingestion_skip",
+                        record_id=record_id,
+                        reason="object_exists",
+                    )
+                    records_skipped += 1
+                    continue
+                # overwrite=true: fall through to write
+
+            try:
+                table, fs, n_samples = generate_synthetic_ecg(run_id, run_date, record_id)
+                upload_parquet_to_minio(table, MINIO_BUCKET, object_key, s3_client=s3_client)
+                cur.execute(
+                    """
+                    INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, record_id, layer, artifact_type)
+                    DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
+                    """,
+                    (run_id, record_id, "raw", "ecg", object_key, "raw_ecg_v1"),
                 )
                 cur.execute(
-                    "UPDATE runs SET status = 'succeeded' WHERE run_id = %s",
-                    (run_id,),
+                    """
+                    INSERT INTO quality_metrics (run_id, record_id, sampling_hz, n_samples, n_channels, atr_exists)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, record_id)
+                    DO UPDATE SET
+                        sampling_hz = EXCLUDED.sampling_hz,
+                        n_samples = EXCLUDED.n_samples,
+                        n_channels = EXCLUDED.n_channels,
+                        atr_exists = EXCLUDED.atr_exists,
+                        created_at = NOW()
+                    """,
+                    (run_id, record_id, fs, n_samples, 2, False),
                 )
-                conn.commit()
+                records_ok += 1
+            except Exception as e:
                 log_structured(
-                    event="ingestion_end",
-                    run_id=run_id,
-                    status="succeeded",
-                    skipped="true",
-                    overwrite="false",
+                    event="ingestion_record_failed",
+                    record_id=record_id,
+                    error=str(e),
                 )
-                return 0
-            # overwrite=true: fall through to upload + upsert
-
-        # Generate synthetic data and write one Parquet file to MinIO (raw layer)
-        table, fs, n_samples = generate_synthetic_ecg(run_id, run_date, RECORD_ID)
-        upload_parquet_to_minio(table, MINIO_BUCKET, object_key, s3_client=s3_client)
-
-        # Upsert artifact + quality_metrics (safe for overwrite re-runs)
-        cur.execute(
-            """
-            INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (run_id, record_id, layer, artifact_type)
-            DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
-            """,
-            (run_id, RECORD_ID, "raw", "ecg", object_key, "raw_ecg_v1"),
-        )
-        cur.execute(
-            """
-            INSERT INTO quality_metrics (run_id, record_id, sampling_hz, n_samples, n_channels, atr_exists)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (run_id, record_id)
-            DO UPDATE SET
-                sampling_hz = EXCLUDED.sampling_hz,
-                n_samples = EXCLUDED.n_samples,
-                n_channels = EXCLUDED.n_channels,
-                atr_exists = EXCLUDED.atr_exists,
-                created_at = NOW()
-            """,
-            (run_id, RECORD_ID, fs, n_samples, 2, False),
-        )
+                records_failed += 1
+                continue
 
         conn.commit()
 
-        # Mark run as succeeded
+        # Run status from counts (skipped counts as success: failed==0 → succeeded)
+        if records_failed == 0:
+            status = "succeeded"
+        elif records_ok > 0 or records_skipped > 0:
+            status = "partial_success"
+        else:
+            status = "failed"
+
         cur.execute(
-            "UPDATE runs SET status = 'succeeded' WHERE run_id = %s",
-            (run_id,),
+            "UPDATE runs SET status = %s WHERE run_id = %s",
+            (status, run_id),
         )
         conn.commit()
 
         log_structured(
             event="ingestion_end",
             run_id=run_id,
-            status="succeeded",
-            skipped="false",
+            status=status,
+            records_total=len(record_ids),
+            records_ok=records_ok,
+            records_skipped=records_skipped,
+            records_failed=records_failed,
             overwrite="true" if INGEST_OVERWRITE else "false",
         )
-        return 0
+        return 0 if records_failed == 0 else 1
 
     except Exception as e:
         if conn:
@@ -261,14 +343,14 @@ def main() -> int:
                 cur = conn.cursor()
                 cur.execute(
                     "UPDATE runs SET status = 'failed', notes = %s WHERE run_id = %s",
-                    (str(e)[:500], (RUN_ID or "").strip()),
+                    (str(e)[:500], run_id),
                 )
                 conn.commit()
             except Exception:
                 conn.rollback()
             finally:
                 conn.close()
-        log_structured(event="ingestion_end", run_id=RUN_ID, status="failed", error=str(e))
+        log_structured(event="ingestion_end", run_id=run_id, status="failed", error=str(e))
         return 1
     finally:
         if conn and not conn.closed:
