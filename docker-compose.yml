@@ -54,6 +54,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ./data/mitdb:/data/mitdb
     environment:
       RUN_ID: ${RUN_ID:-}
       RUN_DATE: ${RUN_DATE:-}
@@ -70,6 +72,8 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
       INGEST_OVERWRITE: ${INGEST_OVERWRITE:-false}
+      WFDB_LOCAL_DIR: ${WFDB_LOCAL_DIR:-/data/mitdb}
+      USE_SYNTHETIC_DATA: ${USE_SYNTHETIC_DATA:-true}
     profiles:
       - ingestion
 

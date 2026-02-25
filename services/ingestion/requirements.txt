@@ -2,3 +2,4 @@ psycopg2-binary
 numpy
 pyarrow
 boto3
+wfdb
