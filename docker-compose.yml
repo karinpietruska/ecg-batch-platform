@@ -74,6 +74,7 @@ services:
       INGEST_OVERWRITE: ${INGEST_OVERWRITE:-false}
       WFDB_LOCAL_DIR: ${WFDB_LOCAL_DIR:-/data/mitdb}
       USE_SYNTHETIC_DATA: ${USE_SYNTHETIC_DATA:-true}
+      DEV_SLICE_SECONDS: ${DEV_SLICE_SECONDS:-}
     profiles:
       - ingestion
 

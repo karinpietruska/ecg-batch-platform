@@ -1,8 +1,8 @@
 """
-Ingestion service – v0.3 multi-record synthetic
+Ingestion service – v0.3 multi-record + WFDB (MIT-BIH)
 
-Supports RECORD_IDS / RECORD_RANGE; per-record idempotency; run status
-succeeded / partial_success / failed; fail-per-record with counts.
+Supports synthetic or real WFDB data; RECORD_IDS / RECORD_RANGE; per-record
+idempotency; run status succeeded / partial_success / failed; fail-per-record.
 """
 import os
 import sys
@@ -12,6 +12,7 @@ import tempfile
 import boto3
 import numpy as np
 import psycopg2
+import wfdb
 from psycopg2.extras import RealDictCursor
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -44,6 +45,18 @@ RECORD_LIMIT_RAW = os.environ.get("RECORD_LIMIT")  # optional, truncate for dev
 # Idempotency: if true, overwrite existing object and upsert metadata; if false, skip when object exists
 _OVERWRITE_RAW = (os.environ.get("INGEST_OVERWRITE", "false") or "false").strip().lower()
 INGEST_OVERWRITE = _OVERWRITE_RAW in ("1", "true", "yes", "y", "on")
+
+# Data source: synthetic (default) or WFDB from local dir
+_USE_SYNTH_RAW = (os.environ.get("USE_SYNTHETIC_DATA", "true") or "true").strip().lower()
+USE_SYNTHETIC_DATA = _USE_SYNTH_RAW in ("1", "true", "yes", "y", "on")
+WFDB_LOCAL_DIR = (os.environ.get("WFDB_LOCAL_DIR") or "/data/mitdb").strip()
+# Optional: only read first N seconds for fast dev (e.g. 10); 0 or negative = disabled
+DEV_SLICE_SECONDS_RAW = os.environ.get("DEV_SLICE_SECONDS")
+try:
+    _dev_sec = int((DEV_SLICE_SECONDS_RAW or "").strip()) if (DEV_SLICE_SECONDS_RAW and DEV_SLICE_SECONDS_RAW.strip()) else 0
+except (ValueError, AttributeError):
+    _dev_sec = 0
+DEV_SLICE_SECONDS = _dev_sec if _dev_sec > 0 else None
 
 
 def log_structured(**kwargs):
@@ -160,6 +173,68 @@ def generate_synthetic_ecg(run_id: str, run_date: str, record_id: str):
     return table, fs, n_samples
 
 
+def load_wfdb_record(run_id: str, run_date: str, record_id: str):
+    """
+    Load one WFDB record from WFDB_LOCAL_DIR and build Parquet-ready table.
+    Uses p_signal if present, else d_signal.astype(np.float32).
+    Single channel: lead_1 set to zeros and log. Optional DEV_SLICE_SECONDS truncates.
+    Returns (table, fs, n_samples, n_channels, atr_exists).
+    Raises on missing/invalid record so caller can count records_failed.
+    """
+    path = os.path.join(WFDB_LOCAL_DIR, record_id)
+    record = wfdb.rdrecord(path)
+
+    if record.p_signal is not None:
+        sig = np.asarray(record.p_signal, dtype=np.float32)
+    else:
+        sig = np.asarray(record.d_signal, dtype=np.float32)
+
+    fs = int(record.fs)
+    n_total = sig.shape[0]
+    n_ch = sig.shape[1] if sig.ndim > 1 else 1
+    if sig.ndim == 1:
+        sig = sig.reshape(-1, 1)
+
+    if DEV_SLICE_SECONDS is not None and DEV_SLICE_SECONDS > 0:
+        max_samples = int(fs * DEV_SLICE_SECONDS)
+        sig = sig[:max_samples]
+
+    n_samples = sig.shape[0]  # always from sliced array
+
+    sample_index = np.arange(n_samples, dtype=np.int64)
+    t_sec = sample_index / float(fs)
+
+    lead_0 = sig[:, 0]
+    if n_ch >= 2:
+        lead_1 = sig[:, 1]
+        n_channels = 2
+    else:
+        lead_1 = np.zeros(n_samples, dtype=np.float32)
+        n_channels = 1
+        log_structured(event="wfdb_single_channel", record_id=record_id)
+
+    run_id_vals = np.full(n_samples, run_id, dtype=object)
+    run_date_vals = np.full(n_samples, run_date, dtype=object)
+    record_id_vals = np.full(n_samples, record_id, dtype=object)
+
+    table = pa.table(
+        {
+            "run_id": pa.array(run_id_vals),
+            "run_date": pa.array(run_date_vals),
+            "record_id": pa.array(record_id_vals),
+            "sample_index": pa.array(sample_index),
+            "t_sec": pa.array(t_sec),
+            "lead_0": pa.array(lead_0),
+            "lead_1": pa.array(lead_1),
+        }
+    )
+
+    atr_path = os.path.join(WFDB_LOCAL_DIR, f"{record_id}.atr")
+    atr_exists = os.path.exists(atr_path)
+
+    return table, fs, n_samples, n_channels, atr_exists
+
+
 def upload_parquet_to_minio(table: pa.Table, bucket: str, key: str, s3_client=None) -> None:
     """Write table to a temp Parquet file and upload to MinIO via boto3."""
     if s3_client is None:
@@ -193,7 +268,13 @@ def main() -> int:
         )
         return 1
 
-    log_structured(event="ingestion_start", run_id=run_id, run_date=run_date)
+    log_structured(
+        event="ingestion_start",
+        run_id=run_id,
+        run_date=run_date,
+        use_synthetic=USE_SYNTHETIC_DATA,
+        wfdb_dir=WFDB_LOCAL_DIR if not USE_SYNTHETIC_DATA else None,
+    )
 
     conn = None
     try:
@@ -274,7 +355,14 @@ def main() -> int:
                 # overwrite=true: fall through to write
 
             try:
-                table, fs, n_samples = generate_synthetic_ecg(run_id, run_date, record_id)
+                if USE_SYNTHETIC_DATA:
+                    table, fs, n_samples = generate_synthetic_ecg(run_id, run_date, record_id)
+                    n_channels = 2
+                    atr_exists = False
+                else:
+                    table, fs, n_samples, n_channels, atr_exists = load_wfdb_record(
+                        run_id, run_date, record_id
+                    )
                 upload_parquet_to_minio(table, MINIO_BUCKET, object_key, s3_client=s3_client)
                 cur.execute(
                     """
@@ -297,7 +385,7 @@ def main() -> int:
                         atr_exists = EXCLUDED.atr_exists,
                         created_at = NOW()
                     """,
-                    (run_id, record_id, fs, n_samples, 2, False),
+                    (run_id, record_id, fs, n_samples, n_channels, atr_exists),
                 )
                 records_ok += 1
             except Exception as e:
