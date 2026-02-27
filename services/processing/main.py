@@ -1,8 +1,8 @@
 """
-Processing service – skeleton v0.1
+Processing service – rr_intervals v1
 
-Reads raw ECG artifacts for a run, and writes empty-but-typed rr_intervals_v1
-artifacts plus metadata. No R-peak detection yet.
+Reads raw ECG artifacts for a run, computes RR-intervals using NeuroKit2,
+writes rr_intervals_v1 artifacts, and records processing metrics.
 """
 import os
 import sys
@@ -11,6 +11,7 @@ import tempfile
 
 import boto3
 import numpy as np
+import neurokit2 as nk
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import pyarrow as pa
@@ -174,29 +175,127 @@ def discover_raw_records(conn, run_id: str) -> set[str]:
     return {row["record_id"] for row in rows}
 
 
+RR_INTERVALS_SCHEMA = pa.schema(
+    [
+        pa.field("run_id", pa.string()),
+        pa.field("run_date", pa.string()),
+        pa.field("record_id", pa.string()),
+        pa.field("beat_index", pa.int64()),
+        pa.field("peak_index", pa.int64()),
+        pa.field("t_peak_sec", pa.float64()),
+        pa.field("rr_interval_sec", pa.float64()),
+    ]
+)
+
+
 def empty_rr_intervals_table(run_id: str, run_date: str, record_id: str) -> pa.Table:
+    """Build an empty rr_intervals_v1 table with the final schema and zero rows."""
+    arrays = [pa.array([], type=field.type) for field in RR_INTERVALS_SCHEMA]
+    return pa.Table.from_arrays(arrays, schema=RR_INTERVALS_SCHEMA)
+
+
+def compute_rr_intervals_from_raw(raw_table: pa.Table, run_id: str, run_date: str, record_id: str):
     """
-    Build an empty rr_intervals_v1 table with the final schema and zero rows.
-    Columns:
-      - run_id (string)
-      - run_date (string)
-      - record_id (string)
-      - beat_index (int64)
-      - peak_index (int64)
-      - t_peak_sec (float64)
-      - rr_interval_sec (float64, nullable)
+    Compute RR-intervals from a raw_ecg_v1 table using NeuroKit2.
+
+    Uses lead_0 only. Sampling rate fs is inferred from t_sec as
+    fs ≈ 1 / median(diff(t_sec)).
+
+    Returns:
+      - rr_table: rr_intervals_v1 table (may have 0 rows)
+      - metrics: dict with n_beats, mean_rr_ms, sdnn_ms (floats or None)
     """
-    return pa.table(
+    try:
+        t_sec_arr = raw_table["t_sec"].to_numpy()
+        lead0_arr = raw_table["lead_0"].to_numpy()
+    except KeyError as e:
+        raise ValueError(f"raw table missing required column: {e}") from e
+
+    n_samples = t_sec_arr.shape[0]
+    if n_samples < 2:
+        # Not enough data to compute RR intervals
+        rr_table = empty_rr_intervals_table(run_id, run_date, record_id)
+        metrics = {"n_beats": 0, "mean_rr_ms": None, "sdnn_ms": None}
+        return rr_table, metrics
+
+    dt = np.diff(t_sec_arr.astype(float))
+    dt_pos = dt[dt > 0]
+    if dt_pos.size == 0:
+        raise ValueError("could not infer sampling rate fs from t_sec (no positive deltas)")
+
+    fs = float(1.0 / np.median(dt_pos))
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError(f"invalid inferred sampling rate fs={fs}")
+
+    try:
+        cleaned = nk.ecg_clean(lead0_arr.astype(float), sampling_rate=fs)
+    except Exception:
+        cleaned = lead0_arr.astype(float)
+
+    # Explicit method for reproducibility across NeuroKit2 versions
+    _, info = nk.ecg_peaks(cleaned, sampling_rate=fs, method="pantompkins1985")
+    # NeuroKit2 may return peaks as arrays; avoid using `or` on arrays
+    peaks = info.get("ECG_R_Peaks", None)
+    if peaks is None:
+        peaks = info.get("ECG_R_Peak", None)
+    if peaks is None:
+        peaks = np.array([], dtype=np.int64)
+    peaks = np.asarray(peaks, dtype=np.int64)
+    # Sanitize peaks: within range, unique, sorted
+    peaks = np.unique(peaks[(peaks >= 0) & (peaks < n_samples)])
+    n_peaks = int(peaks.size)
+
+    if n_peaks == 0:
+        rr_table = empty_rr_intervals_table(run_id, run_date, record_id)
+        metrics = {"n_beats": 0, "mean_rr_ms": None, "sdnn_ms": None}
+        return rr_table, metrics
+
+    t_peak_sec = t_sec_arr[peaks].astype(float)
+
+    # Build RR intervals: first interval is None
+    rr_interval_sec_list: list[float | None] = [None] * n_peaks
+    if n_peaks > 1:
+        diffs = np.diff(t_peak_sec)
+        for i, v in enumerate(diffs, start=1):
+            rr_interval_sec_list[i] = float(v)
+
+    # Metrics from RR intervals (exclude first None)
+    valid_rr = np.array([v for v in rr_interval_sec_list[1:] if v is not None], dtype=float)
+    if valid_rr.size >= 1:
+        mean_rr_ms = float(np.mean(valid_rr) * 1000.0)
+    else:
+        mean_rr_ms = None
+    if valid_rr.size >= 2:
+        sdnn_ms = float(np.std(valid_rr, ddof=1) * 1000.0)
+    else:
+        sdnn_ms = None
+
+    beat_index = np.arange(n_peaks, dtype=np.int64)
+    peak_index = peaks.astype(np.int64)
+
+    run_id_vals = np.full(n_peaks, run_id, dtype=object)
+    run_date_vals = np.full(n_peaks, run_date, dtype=object)
+    record_id_vals = np.full(n_peaks, record_id, dtype=object)
+
+    rr_table = pa.table(
         {
-            "run_id": pa.array([], type=pa.string()),
-            "run_date": pa.array([], type=pa.string()),
-            "record_id": pa.array([], type=pa.string()),
-            "beat_index": pa.array([], type=pa.int64()),
-            "peak_index": pa.array([], type=pa.int64()),
-            "t_peak_sec": pa.array([], type=pa.float64()),
-            "rr_interval_sec": pa.array([], type=pa.float64()),
+            "run_id": pa.array(run_id_vals),
+            "run_date": pa.array(run_date_vals),
+            "record_id": pa.array(record_id_vals),
+            "beat_index": pa.array(beat_index),
+            "peak_index": pa.array(peak_index),
+            "t_peak_sec": pa.array(t_peak_sec),
+            "rr_interval_sec": pa.array(rr_interval_sec_list, type=pa.float64()),
         }
-    )
+    ).cast(RR_INTERVALS_SCHEMA)
+
+    metrics = {
+        "n_beats": n_peaks,
+        "mean_rr_ms": mean_rr_ms,
+        "sdnn_ms": sdnn_ms,
+    }
+
+    return rr_table, metrics
 
 
 def upsert_service_run(cur, run_id: str, status: str, notes: str | None, set_started: bool, set_ended: bool):
@@ -256,7 +355,7 @@ def main() -> int:
         cur = conn.cursor()
 
         # service_runs: mark processing as running
-        upsert_service_run(cur, run_id, status="running", notes="processing skeleton v0.1", set_started=True, set_ended=False)
+        upsert_service_run(cur, run_id, status="running", notes="processing rr_intervals v1", set_started=True, set_ended=False)
         conn.commit()
 
         # Discover available raw records
@@ -341,11 +440,11 @@ def main() -> int:
                 # Ensure raw exists (will raise if missing)
                 if not object_exists(s3_client, MINIO_BUCKET, raw_key):
                     raise FileNotFoundError(f"raw artifact missing at {raw_key}")
-                # For now we don't need the content, but this validates readability
-                _ = download_parquet_from_minio(MINIO_BUCKET, raw_key, s3_client=s3_client)
 
-                table = empty_rr_intervals_table(run_id, run_date, record_id)
-                upload_parquet_to_minio(table, MINIO_BUCKET, proc_key, s3_client=s3_client)
+                raw_table = download_parquet_from_minio(MINIO_BUCKET, raw_key, s3_client=s3_client)
+
+                rr_table, metrics = compute_rr_intervals_from_raw(raw_table, run_id, run_date, record_id)
+                upload_parquet_to_minio(rr_table, MINIO_BUCKET, proc_key, s3_client=s3_client)
 
                 # Upsert artifact metadata
                 cur.execute(
@@ -357,7 +456,7 @@ def main() -> int:
                     """,
                     (run_id, record_id, "processing", "rr_intervals", proc_key, "rr_intervals_v1"),
                 )
-                # Upsert dummy processing_metrics row
+                # Upsert processing_metrics row
                 cur.execute(
                     """
                     INSERT INTO processing_metrics (run_id, record_id, n_beats, mean_rr_ms, sdnn_ms)
@@ -369,7 +468,13 @@ def main() -> int:
                         sdnn_ms = EXCLUDED.sdnn_ms,
                         created_at = NOW()
                     """,
-                    (run_id, record_id, None, None, None),
+                    (
+                        run_id,
+                        record_id,
+                        metrics["n_beats"],
+                        metrics["mean_rr_ms"],
+                        metrics["sdnn_ms"],
+                    ),
                 )
 
                 records_ok += 1

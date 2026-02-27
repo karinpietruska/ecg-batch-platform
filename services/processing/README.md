@@ -9,25 +9,26 @@ RR-interval artifacts to the `processing/` layer in a way that mirrors the
 ingestion service: per-record idempotency, structured logging, and explicit
 service-level status in `service_runs`.
 
-In the initial skeleton (v0.1), the service does **not** perform R-peak
-detection yet. It validates wiring by creating **empty-but-typed**
+In the initial skeleton (v0.1), the service did **not** perform R-peak
+detection; it validated wiring by creating **empty-but-typed**
 `rr_intervals_v1` artifacts (0 rows, final schema) for each record.
+
+It now performs R-peak detection and RR-interval extraction using NeuroKit2
+and stores per-record RR metrics.
 
 ---
 
-## Responsibilities (skeleton v0.1)
+## Responsibilities
 
 - Discover raw ECG records for a given `run_id` from the `artifacts` table.
 - Optionally apply record filters via `RECORD_IDS` / `RECORD_RANGE` / `RECORD_LIMIT`.
 - For each selected record:
   - Validate that the raw Parquet artifact is present and readable.
-  - Write an empty `rr_intervals_v1` Parquet file to the `processing/` layer.
+  - Compute R-peaks on `lead_0` and derive RR intervals.
+  - Write an `rr_intervals_v1` Parquet file to the `processing/` layer.
   - Register the artifact in the `artifacts` table (`layer='processing'`).
-  - Upsert a placeholder row in `processing_metrics`.
+  - Upsert per-record metrics in `processing_metrics` (e.g. `n_beats`, `mean_rr_ms`, `sdnn_ms`).
 - Record a per-service lifecycle in `service_runs` for `service='processing'`.
-
-Future versions will replace the empty table with real RR-interval content and
-populated metrics.
 
 ---
 
