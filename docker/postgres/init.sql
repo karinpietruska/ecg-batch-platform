@@ -56,4 +56,54 @@ BEGIN
       ADD CONSTRAINT fk_quality_metrics_run
       FOREIGN KEY (run_id) REFERENCES runs(run_id);
   END IF;
+
+  -- service_runs: per-service lifecycle/status per run (ingestion, processing, aggregation)
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_name = 'service_runs'
+  ) THEN
+    CREATE TABLE service_runs (
+        id         SERIAL PRIMARY KEY,
+        run_id     TEXT NOT NULL,
+        service    TEXT NOT NULL,
+        status     TEXT NOT NULL,
+        notes      TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        started_at TIMESTAMPTZ,
+        ended_at   TIMESTAMPTZ
+    );
+
+    CREATE UNIQUE INDEX ux_service_runs_run_service
+    ON service_runs (run_id, service);
+
+    CREATE INDEX idx_service_runs_service_status
+    ON service_runs (service, status);
+
+    ALTER TABLE service_runs
+      ADD CONSTRAINT fk_service_runs_run
+      FOREIGN KEY (run_id) REFERENCES runs(run_id);
+  END IF;
+
+  -- processing_metrics: per-record metrics produced by the processing service
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_name = 'processing_metrics'
+  ) THEN
+    CREATE TABLE processing_metrics (
+        id           SERIAL PRIMARY KEY,
+        run_id       TEXT NOT NULL,
+        record_id    TEXT NOT NULL,
+        n_beats      INT,
+        mean_rr_ms   DOUBLE PRECISION,
+        sdnn_ms      DOUBLE PRECISION,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE UNIQUE INDEX ux_processing_metrics_business_key
+    ON processing_metrics (run_id, record_id);
+
+    ALTER TABLE processing_metrics
+      ADD CONSTRAINT fk_processing_metrics_run
+      FOREIGN KEY (run_id) REFERENCES runs(run_id);
+  END IF;
 END $$;
