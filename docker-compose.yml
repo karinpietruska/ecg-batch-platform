@@ -102,6 +102,30 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
       PROCESS_OVERWRITE: ${PROCESS_OVERWRITE:-false}
 
+  aggregation:
+    build: ./services/aggregation
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      RUN_ID: ${RUN_ID:-}
+      RUN_DATE: ${RUN_DATE:-}
+      RECORD_IDS: ${RECORD_IDS:-}
+      RECORD_RANGE: ${RECORD_RANGE:-}
+      RECORD_LIMIT: ${RECORD_LIMIT:-}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-ecg_metadata}
+      POSTGRES_USER: ${POSTGRES_USER:-ecg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: ${MINIO_BUCKET:-ecg-datalake}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
+      AGG_OVERWRITE: ${AGG_OVERWRITE:-false}
+
 volumes:
   postgres_data:
   minio_data:
