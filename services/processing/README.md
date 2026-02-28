@@ -9,12 +9,19 @@ RR-interval artifacts to the `processing/` layer in a way that mirrors the
 ingestion service: per-record idempotency, structured logging, and explicit
 service-level status in `service_runs`.
 
-In the initial skeleton (v0.1), the service did **not** perform R-peak
-detection; it validated wiring by creating **empty-but-typed**
-`rr_intervals_v1` artifacts (0 rows, final schema) for each record.
+It performs R-peak detection and RR-interval extraction using NeuroKit2
+(explicit method `pantompkins1985` for reproducibility) on **lead_0** only,
+and stores per-record RR metrics in `processing_metrics`.
 
-It now performs R-peak detection and RR-interval extraction using NeuroKit2
-and stores per-record RR metrics.
+---
+
+## Design Principles
+
+- **Storage-first idempotency:** object storage is the source of truth for processing artifact existence.
+- **Deterministic output paths:** object keys are fully derived from run identity (`run_date`, `run_id`, `record_id`).
+- **Per-record isolation:** failure of one record does not stop others; service status reflects aggregate outcome.
+- **Metadata consistency** via DB uniqueness constraints and upserts; database reflects object state but does not define it.
+- **Discovery from artifacts:** candidate records are always resolved from `artifacts` (layer `raw`, artifact_type `ecg`), then optionally filtered.
 
 ---
 
@@ -88,7 +95,7 @@ run is treated as a validation failure.
 
 ---
 
-## Idempotency & Lifecycle
+## Idempotency
 
 Before writing data, the service checks whether the target processing object key
 already exists in object storage:
@@ -100,23 +107,69 @@ Object storage (MinIO) is the primary source of truth for raw/processing
 artifact existence. Database metadata reflects object state but does not define
 it.
 
-Per-service lifecycle is tracked in `service_runs`:
+Database rows in `artifacts` and `processing_metrics` are always written via **upserts**
+(`ON CONFLICT DO UPDATE`) so that reruns can safely refresh metadata for the same
+`(run_id, record_id)` pair.
 
-- At start: upsert `service_runs` with `service='processing'`,
-  `status='running'`, `started_at=NOW()`.
-- At end: update the same row with `status` (`succeeded` / `partial_success` /
-  `failed`), `ended_at=NOW()`, and a `notes` string summarizing counts.
+Database uniqueness constraints:
 
-Exit code:
+- `artifacts`: `(run_id, record_id, layer, artifact_type)`
+- `processing_metrics`: `(run_id, record_id)`
+
+These keys act as safety nets to keep metadata consistent even if idempotency
+checks were bypassed or misconfigured.
+
+---
+
+## Run Lifecycle
+
+For each processing invocation:
+
+1. A row is upserted into `service_runs` with `service='processing'`, `status='running'`, `started_at=NOW()`.
+2. Record IDs are discovered from `artifacts` (layer `raw`, artifact_type `ecg`) for the given `run_id`.
+3. Optional filters (`RECORD_IDS` / `RECORD_RANGE` / `RECORD_LIMIT`) are applied: intersect with discovered set. If filters were provided and intersection is empty → validation failure; if no filters and no raw records → "nothing to do" success.
+4. Each record is processed independently:
+   - Idempotency check against object storage for the target `rr_intervals.parquet` key.
+   - Download raw Parquet, compute RR intervals (NeuroKit2 on lead_0), write `rr_intervals_v1` Parquet.
+   - Upsert `artifacts` and `processing_metrics` in PostgreSQL.
+5. After all records:
+   - `succeeded` if `records_failed == 0`.
+   - `partial_success` if at least one record succeeded and at least one failed.
+   - `failed` if all records failed or record resolution failed.
+
+The process exits with code:
 
 - `0` when no records failed.
-- `1` when at least one record failed or when filters are invalid.
+- `1` when at least one record failed (including filter validation failures).
+
+---
+
+## Testing
+
+The processing service has been validated with:
+
+- Synthetic end-to-end (wiring; metrics may be zero for sine waves).
+- WFDB multi-record runs (`RECORD_IDS=100,101`) with slicing.
+- Full-length WFDB record (no `DEV_SLICE_SECONDS`) for plausible `n_beats` and metrics.
+- Idempotent reruns (skip and overwrite via `PROCESS_OVERWRITE`).
+- Filter validation: empty intersection when filters provided → `processing_no_records_after_filter`, exit 1.
+- Edge case: zero or few peaks (empty or minimal `rr_intervals` table, `mean_rr_ms`/`sdnn_ms` NULL) without crash.
+
+---
+
+## Failure Modes
+
+- **Invalid record filters** (e.g. malformed `RECORD_RANGE`, or filters provided but intersection with raw artifacts empty) → service run marked `failed`, exit code 1; structured log `processing_record_filter_invalid` or `processing_no_records_after_filter`.
+- **Missing or unreadable raw Parquet** → logged as `processing_record_failed`, counted toward `records_failed`; run may end as `partial_success` or `failed`.
+- **Object exists and overwrite disabled** → record skipped, logged as `processing_skip` with `reason='object_exists'`; counts as success for service status.
 
 ---
 
 ## Status
 
-This service becomes operational once the ingestion service and the raw layer
-are available and the processing image has been built. Future versions will
-add real R-peak detection and RR-interval metrics on top of this skeleton.
+This service is operational once the ingestion service and the raw layer are
+available and the processing container image has been built. R-peak detection
+uses NeuroKit2 with method `pantompkins1985`; metrics are stored in
+`processing_metrics`. Orchestration (e.g. scheduled runs) is handled by
+higher-level components.
 

@@ -21,7 +21,7 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
    docker compose up -d
    ```
    This starts:
-   - **PostgreSQL** on port 5432 (metadata: runs, artifacts, quality_metrics).
+   - **PostgreSQL** on port 5432 (metadata: runs, artifacts, quality_metrics, service_runs, processing_metrics).
    - **MinIO** on ports 9000 (API) and 9001 (console).
    - **minio-bootstrap**: creates the bucket from `MINIO_BUCKET` (default `ecg-datalake`) on first run.
 
@@ -43,15 +43,12 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 **Current state:**
 
 - Infrastructure (Postgres + MinIO + bucket bootstrap) is operational.
-- Ingestion service is implemented and runnable as a standalone CLI-style container:
-  - Synthetic mode (default) writes one or more Parquet ECG files to MinIO.
-  - WFDB mode reads real MIT-BIH records from a mounted dataset folder.
-  - Per-record idempotency with overwrite/skip behavior, plus run status tracking.
+- **Ingestion** service is implemented: synthetic or WFDB mode, per-record idempotency, run status in `runs`; raw Parquet in `raw/`.
+- **Processing** service is implemented: discovers raw artifacts, runs R-peak detection (NeuroKit2) and RR-interval extraction, writes `rr_intervals_v1` Parquet to `processing/`, populates `processing_metrics` and `service_runs` for `service='processing'`; same record-filter and idempotency semantics as ingestion.
 
 **Next extensions:**
 
-- Add processing service (RR extraction)
-- Add aggregation service (HRV features)
+- Add aggregation service (Spark-based HRV features)
 - Add batch orchestrator
 
 ---
@@ -73,7 +70,7 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 ├── .env.example            # Example env vars (copy to .env)
 ├── docker/
 │   └── postgres/
-│       └── init.sql        # Metadata schema (runs, artifacts, quality_metrics)
+│       └── init.sql        # Metadata schema (runs, artifacts, quality_metrics, service_runs, processing_metrics)
 ├── services/
 │   ├── ingestion/          # Layer 1 – raw data ingestion
 │   ├── processing/         # Layer 1 – signal processing (RR extraction)
@@ -270,3 +267,82 @@ docker compose run --rm ingestion
 ```
 
 This makes it safe to rerun a batch with the same `RUN_ID` while still being explicit when you intend to overwrite existing raw artifacts.
+
+---
+
+## How to run processing
+
+Processing runs as an **on-demand CLI container**. It discovers which records to process by querying the **artifacts** table for the given `run_id` (layer `raw`, artifact_type `ecg`), then optionally applies the same record filters as ingestion.
+
+**Prerequisite:** At least one ingestion run must have completed for that `run_id` so raw Parquet artifacts exist in MinIO.
+
+General pattern:
+
+```bash
+RUN_ID=<same_run_id_as_ingestion> \
+RUN_DATE=<yyyy-mm-dd> \
+[RECORD_IDS=...] [RECORD_RANGE=...] [RECORD_LIMIT=...] \
+[PROCESS_OVERWRITE=true] \
+docker compose run --rm processing
+```
+
+### Minimal example (process all raw records for a run)
+
+After running ingestion for a run (e.g. `2026-02-27_synth01`), run:
+
+```bash
+RUN_ID=2026-02-27_synth01 \
+RUN_DATE=2026-02-27 \
+docker compose run --rm processing
+```
+
+Behavior:
+
+- Discovers all records that have raw artifacts for that `run_id`.
+- For each record: downloads raw Parquet, runs R-peak detection (NeuroKit2, lead_0 only), writes `rr_intervals_v1` Parquet to `processing/run_date=.../run_id=.../record_id=.../rr_intervals.parquet`, and upserts `artifacts` and `processing_metrics`.
+- Records service lifecycle in `service_runs` with `service='processing'` and status `succeeded` / `partial_success` / `failed` based on counts.
+
+Verify processing results:
+
+```bash
+docker compose exec postgres psql -U ecg -d ecg_metadata -c \
+"SELECT run_id, service, status, notes FROM service_runs WHERE service='processing' ORDER BY ended_at DESC LIMIT 5;"
+
+docker compose exec postgres psql -U ecg -d ecg_metadata -c \
+"SELECT run_id, record_id, n_beats, mean_rr_ms, sdnn_ms FROM processing_metrics WHERE run_id='2026-02-27_synth01';"
+```
+
+### Record filters
+
+You can limit which records are processed using the same variables as ingestion:
+
+- `RECORD_IDS` (e.g. `100,101`) – takes precedence over `RECORD_RANGE`.
+- `RECORD_RANGE` (e.g. `100-124`).
+- `RECORD_LIMIT` – cap after resolving IDs/range.
+
+The service **intersects** these with the set of records that have raw artifacts. If you provide filters and the intersection is empty, the run is treated as a validation failure (exit 1).
+
+Example (process only records 100 and 101 for a WFDB run):
+
+```bash
+RUN_ID=2026-03-02_proc_rr_wfdb_multi \
+RUN_DATE=2026-03-02 \
+RECORD_IDS=100,101 \
+docker compose run --rm processing
+```
+
+### Idempotency: skip vs overwrite
+
+- **`PROCESS_OVERWRITE=false`** (default): if the processing artifact (`rr_intervals.parquet`) already exists in MinIO for a record, that record is **skipped** (logged as `processing_skip`); counts as success for run status.
+- **`PROCESS_OVERWRITE=true`**: existing processing artifacts are recomputed and overwritten; DB rows are upserted.
+
+Example overwrite:
+
+```bash
+RUN_ID=2026-02-27_synth01 \
+RUN_DATE=2026-02-27 \
+PROCESS_OVERWRITE=true \
+docker compose run --rm processing
+```
+
+Exit code: `0` when no records failed; `1` when at least one record failed or when record filter validation fails.
