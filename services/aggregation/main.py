@@ -1,8 +1,9 @@
 """
-Aggregation service – skeleton v0.1 (Spark + S3A)
+Aggregation service – HRV features (Spark + S3A)
 
 Discovers processing rr_intervals artifacts for a run, reads them via Spark from MinIO (S3A),
-writes a run-level features.parquet (placeholder), and upserts artifacts + features_metrics.
+computes per-record HRV metrics (mean_rr_ms, sdnn_ms, rmssd_ms, pnn50, n_rr), writes a run-level
+features.parquet, and upserts artifacts + features_metrics.
 """
 import os
 import sys
@@ -296,10 +297,13 @@ def main() -> int:
         paths = [s3a_path(MINIO_BUCKET, candidate_map[rid]) for rid in record_list]
 
         # service_runs: running
-        upsert_service_run(cur, run_id, status="running", notes="aggregation skeleton v0.1", set_started=True, set_ended=False)
+        upsert_service_run(cur, run_id, status="running", notes="aggregation HRV v1", set_started=True, set_ended=False)
         conn.commit()
 
-        # Spark: read rr_intervals, write placeholder features (run-level)
+        # Spark: read rr_intervals, compute HRV metrics, write run-level features.parquet
+        from pyspark.sql import functions as F
+        from pyspark.sql.window import Window
+
         spark = build_spark_session()
         try:
             df = spark.read.parquet(*paths)
@@ -316,18 +320,30 @@ def main() -> int:
             log_structured(event="aggregation_spark_read_failed", run_id=run_id, error=str(e))
             return 1
 
-        # Placeholder: one row per (run_id, record_id) with dummy feature columns
-        from pyspark.sql import functions as F
-        features_df = (
-            df.groupBy("run_id", "run_date", "record_id")
-            .agg(
-                F.lit(0.0).alias("mean_rr_ms"),
-                F.lit(0.0).alias("sdnn_ms"),
-                F.lit(0.0).alias("rmssd_ms"),
-                F.lit(0.0).alias("pnn50"),
-                F.lit(0).alias("n_rr"),
-            )
+        # Valid RR only; rr_ms in milliseconds
+        df_valid = df.filter(F.col("rr_interval_sec").isNotNull()).withColumn(
+            "rr_ms", F.col("rr_interval_sec") * 1000
         )
+        # Successive difference within each record (ordered by beat_index)
+        w = Window.partitionBy("run_id", "record_id").orderBy("beat_index")
+        df_valid = df_valid.withColumn("diff_ms", F.col("rr_ms") - F.lag("rr_ms", 1).over(w))
+
+        # Per-record HRV: mean_rr_ms, sdnn_ms (ms), rmssd_ms, pnn50 (0..1), n_rr = count(diff_ms)
+        features_agg = df_valid.groupBy("run_id", "run_date", "record_id").agg(
+            F.avg("rr_ms").alias("mean_rr_ms"),
+            F.stddev_samp("rr_ms").alias("sdnn_ms"),
+            F.sqrt(F.avg(F.col("diff_ms") * F.col("diff_ms"))).alias("rmssd_ms"),
+            F.avg(F.when(F.abs(F.col("diff_ms")) > 50, 1).otherwise(0)).alias("pnn50"),
+            F.count(F.col("diff_ms")).alias("n_rr"),
+        )
+
+        # One row per record (include records with no valid RR → all metrics null)
+        ref_df = spark.createDataFrame(
+            [(run_id, run_date, rid) for rid in record_list],
+            ["run_id", "run_date", "record_id"],
+        )
+        features_df = ref_df.join(features_agg, ["run_id", "run_date", "record_id"], "left")
+
         out_path = s3a_path(MINIO_BUCKET, out_key)
         try:
             features_df.write.mode("overwrite").parquet(out_path)
@@ -344,8 +360,15 @@ def main() -> int:
             log_structured(event="aggregation_spark_write_failed", run_id=run_id, error=str(e))
             return 1
 
-        # Option B: one artifact row per record, same uri
-        for record_id in record_list:
+        # Option B: one artifact row per record, same uri; features_metrics from computed DF
+        for row in features_df.collect():
+            record_id = row.record_id
+            mean_rr_ms = float(row.mean_rr_ms) if row.mean_rr_ms is not None else None
+            sdnn_ms = float(row.sdnn_ms) if row.sdnn_ms is not None else None
+            rmssd_ms = float(row.rmssd_ms) if row.rmssd_ms is not None else None
+            pnn50_val = float(row.pnn50) if row.pnn50 is not None else None
+            n_rr_val = int(row.n_rr) if row.n_rr is not None else None
+
             cur.execute(
                 """
                 INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
@@ -368,7 +391,7 @@ def main() -> int:
                     n_rr = EXCLUDED.n_rr,
                     created_at = NOW()
                 """,
-                (run_id, record_id, None, None, None, None, None),
+                (run_id, record_id, mean_rr_ms, sdnn_ms, rmssd_ms, pnn50_val, n_rr_val),
             )
 
         n_ok = len(record_list)

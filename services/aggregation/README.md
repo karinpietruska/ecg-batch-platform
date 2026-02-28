@@ -8,7 +8,7 @@ The aggregation service reads processed RR-interval artifacts from the `processi
 
 This service operates as a **CLI-first batch container** (PySpark + S3A for MinIO). It uses the same run identity and filter semantics as ingestion and processing, and records its lifecycle in `service_runs` with `service='aggregation'`.
 
-**Skeleton (v0.1):** Currently writes a placeholder features dataset (one row per record with dummy metrics) to validate Spark ↔ MinIO (S3A) and DB wiring. Real metrics (mean_rr_ms, sdnn_ms, rmssd_ms, pnn50, n_rr) will be computed in a follow-up step.
+**HRV metrics (v1):** Computes per-record time-domain HRV from `rr_interval_sec` (see [Data model](#data-model) for definitions) and writes run-level `features.parquet` plus `features_metrics` and `artifacts`.
 
 ---
 
@@ -21,13 +21,13 @@ This service operates as a **CLI-first batch container** (PySpark + S3A for MinI
 
 ---
 
-## Responsibilities (skeleton v0.1)
+## Responsibilities
 
 - Discover processing artifacts for the given `run_id` from PostgreSQL.
 - Apply optional record filters (same intersection rules as processing).
 - Read `rr_intervals` Parquet from MinIO via Spark S3A.
-- Write a run-level placeholder `features.parquet` (one row per `run_id`, `record_id`).
-- Upsert `artifacts` (layer `aggregation`, artifact_type `features`, schema_ver `features_v1`) and `features_metrics` (placeholder values).
+- Compute per-record HRV metrics (see below) and write run-level `features.parquet`.
+- Upsert `artifacts` (layer `aggregation`, artifact_type `features`, schema_ver `features_v1`) and `features_metrics` with computed values.
 - Record `service_runs` for `service='aggregation'` with status and counts.
 
 ---
@@ -42,7 +42,19 @@ aggregation/run_date=YYYY-MM-DD/run_id=<run_id>/features.parquet/
 
 (Spark writes a directory; object keys have this prefix.)
 
-**features_v1 (placeholder) columns:** `run_id`, `run_date`, `record_id`, `mean_rr_ms`, `sdnn_ms`, `rmssd_ms`, `pnn50`, `n_rr`.
+**features_v1 columns:** `run_id`, `run_date`, `record_id`, `mean_rr_ms`, `sdnn_ms`, `rmssd_ms`, `pnn50`, `n_rr`.
+
+**HRV metric definitions** (from non-null `rr_interval_sec`; `rr_ms = rr_interval_sec * 1000`; successive difference `diff_ms = rr_ms - lag(rr_ms)` within each record, ordered by `beat_index`):
+
+| Column       | Definition |
+|-------------|------------|
+| `mean_rr_ms` | Mean of `rr_ms` over non-null RR (ms). |
+| `sdnn_ms`    | Sample standard deviation of `rr_ms` (ms). |
+| `rmssd_ms`   | √(mean of `diff_ms²`); only non-null `diff_ms`. |
+| `pnn50`      | Fraction in [0, 1] of `abs(diff_ms) > 50` over non-null `diff_ms`. |
+| `n_rr`       | Count of non-null `diff_ms` (number of successive differences used). |
+
+Records with no valid RR or only one RR get a row with NULLs where undefined (e.g. `sdnn_ms`, `rmssd_ms`, `pnn50` when `n_rr` &lt; 2).
 
 ---
 
@@ -67,4 +79,4 @@ aggregation/run_date=YYYY-MM-DD/run_id=<run_id>/features.parquet/
 
 ## Status
 
-This service is a **skeleton** for Spark-based aggregation. It is operational once processing has produced `rr_intervals` artifacts and the aggregation image is built. S3A is used to read/write MinIO; if S3A setup blocks progress, a local-mount fallback can be used instead.
+This service computes HRV features from processing `rr_intervals` and writes run-level Parquet plus `features_metrics`. It is operational once processing has produced `rr_intervals` artifacts and the aggregation image is built. S3A is used to read/write MinIO.
