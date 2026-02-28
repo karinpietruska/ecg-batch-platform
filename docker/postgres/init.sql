@@ -106,4 +106,29 @@ BEGIN
       ADD CONSTRAINT fk_processing_metrics_run
       FOREIGN KEY (run_id) REFERENCES runs(run_id);
   END IF;
+
+  -- features_metrics: per-record HRV features produced by the aggregation service (Spark)
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_name = 'features_metrics'
+  ) THEN
+    CREATE TABLE features_metrics (
+        id           SERIAL PRIMARY KEY,
+        run_id       TEXT NOT NULL,
+        record_id    TEXT NOT NULL,
+        mean_rr_ms   DOUBLE PRECISION,
+        sdnn_ms      DOUBLE PRECISION,
+        rmssd_ms     DOUBLE PRECISION,
+        pnn50        DOUBLE PRECISION,
+        n_rr         INT,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE UNIQUE INDEX ux_features_metrics_business_key
+    ON features_metrics (run_id, record_id);
+
+    ALTER TABLE features_metrics
+      ADD CONSTRAINT fk_features_metrics_run
+      FOREIGN KEY (run_id) REFERENCES runs(run_id);
+  END IF;
 END $$;
