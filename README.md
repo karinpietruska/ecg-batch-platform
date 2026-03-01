@@ -12,11 +12,11 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 **Status ownership:** `runs.status` is owned by ingestion. `service_runs.status` is owned by processing and aggregation. The **`artifacts`** table is the lineage backbone: it links run_id, record_id, layer, and artifact location so downstream services know what to read. Downstream services never assume file paths; they discover inputs exclusively via `artifacts`.
 
 ```
-Ingestion (raw/)  →  Processing (processing/)  →  Aggregation (aggregation/)
-       |                      |                            |
-      runs              service_runs                  service_runs
-                             ↓                              ↓
-                    processing_metrics              features_metrics
+Ingestion → artifacts → Processing → artifacts → Aggregation
+      |                       |                         |
+     runs                service_runs              service_runs
+                               ↓                         ↓
+                       processing_metrics        features_metrics
 ```
 
 **Design guarantees**
@@ -78,7 +78,7 @@ Object paths under the configured bucket (default `ecg-datalake`):
 
 ## Full pipeline example
 
-Run all three layers for the same run identity, then verify:
+Run all three Layer 1 services for the same run identity, then verify:
 
 ```bash
 # 1. Ingestion
@@ -96,9 +96,12 @@ Check status for the run:
 ```bash
 docker compose exec postgres psql -U ecg -d ecg_metadata -c \
 "SELECT service, status FROM service_runs WHERE run_id='demo_01';"
+
+docker compose exec postgres psql -U ecg -d ecg_metadata -c \
+"SELECT run_id, status FROM runs WHERE run_id='demo_01';"
 ```
 
-(Use synthetic mode by default; for WFDB, set `USE_SYNTHETIC_DATA=false` and ensure MIT-BIH data is mounted.)
+(Ingestion writes to `runs`; processing and aggregation write to `service_runs`. Use synthetic mode by default; for WFDB, set `USE_SYNTHETIC_DATA=false` and ensure MIT-BIH data is mounted.)
 
 ---
 
@@ -129,7 +132,7 @@ docker compose exec postgres psql -U ecg -d ecg_metadata -c \
 
 ## Project layout
 
-Layout follows the architecture in `docs/architecture_diagram.png`: Layer 0 = orchestration, Layer 1 = microservices, Layer 2 = storage & metadata.
+Layout follows the architecture in `docs/architecture_diagram.png`: Layer 0 = orchestration, Layer 1 = microservices. Runtime infrastructure (Postgres + MinIO) is started via Docker Compose.
 
 ```
 ├── .env.example            # Example env vars (copy to .env)
@@ -142,14 +145,14 @@ Layout follows the architecture in `docs/architecture_diagram.png`: Layer 0 = or
 │   ├── processing/         # Layer 1 – signal processing (RR extraction) → processing/ + processing_metrics
 │   └── aggregation/        # Layer 1 – feature aggregation (Spark HRV) → aggregation/ + features_metrics
 │
-├── docker/                  # Layer 2 – storage & metadata (schema / config)
+├── docker/                  # Infrastructure configuration (Postgres schema, etc.)
 │   └── postgres/
 │       └── init.sql         # PostgreSQL metadata schema (runs, artifacts, service_runs, processing_metrics, features_metrics, …)
 │
 └── scripts/                 # Optional utilities
 ```
 
-**Layer 2 in runtime:** PostgreSQL (metadata DB) and MinIO (S3 data lake) are started via `docker compose`; MinIO has no repo folder—bucket and paths are configured in compose and `.env`.
+**Runtime infrastructure:** PostgreSQL (metadata DB) and MinIO (S3 data lake) are started via `docker compose`; MinIO has no repo folder—bucket and paths are configured in compose and `.env`.
 
 ---
 
@@ -488,7 +491,7 @@ docker compose run --rm aggregation
 ### Idempotency: skip vs overwrite
 
 - **`AGG_OVERWRITE=false`** (default): if the run-level features path already exists in MinIO, the **entire run** is skipped (logged as `aggregation_skip`, scope=run); no record discovery or filter evaluation is performed.
-- **`AGG_OVERWRITE=true`**: existing run-level features are recomputed and overwritten; `artifacts` and `features_metrics` are upserted.
+- **`AGG_OVERWRITE=true`**: existing run-level features are recomputed and overwritten; `artifacts` and `features_metrics` are upserted. If you want filter validation to execute for an existing output, set `AGG_OVERWRITE=true`; otherwise the job will skip before evaluating filters.
 
 Example overwrite:
 
