@@ -101,6 +101,8 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
       PROCESS_OVERWRITE: ${PROCESS_OVERWRITE:-false}
+    profiles:
+      - processing
 
   aggregation:
     build: ./services/aggregation
@@ -125,6 +127,8 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-changeme}
       AGG_OVERWRITE: ${AGG_OVERWRITE:-false}
+    profiles:
+      - aggregation
 
 volumes:
   postgres_data:
