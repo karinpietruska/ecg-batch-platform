@@ -91,7 +91,7 @@ Metric values are written as DOUBLE PRECISION without rounding; formatting/round
 
 ## Idempotency and lifecycle
 
-- **Run-level:** If any object exists under `aggregation/run_date=.../run_id=.../features.parquet` and `AGG_OVERWRITE=false`, the service skips the run (logs `aggregation_skip`, scope=run) and exits 0. **Note:** Run-level idempotency is evaluated *before* record discovery and filter validation. If the run-level features dataset already exists and overwrite is disabled, the service skips without evaluating filters. To force filter validation or recomputation for an existing run, set `AGG_OVERWRITE=true`.
+- **Run-level:** If any object exists under `aggregation/run_date=.../run_id=.../features.parquet` and `AGG_OVERWRITE=false`, the service skips the run (logs `aggregation_skip`, scope=run) and exits 0. **Note:** Run-level idempotency is evaluated *before* record discovery and filter validation. If the run-level features dataset already exists and overwrite is disabled, the service skips without evaluating filters. To force filter validation or recomputation for an existing run, set `AGG_OVERWRITE=true`. **Partial output:** Existence is prefix-based (any object under the path counts). If a run crashes mid-write and you rerun without `AGG_OVERWRITE`, it may skip due to partial outputs; use `AGG_OVERWRITE=1` to force recompute.
 - **service_runs:** At start, upsert `status='running'`; at end, set `status` (`succeeded` / `failed`), `ended_at`, and `notes` with counts. Exit code 0 when no records failed.
 - **DB upserts:** `artifacts` and `features_metrics` are written via upserts (`ON CONFLICT DO UPDATE`). Uniqueness: `artifacts` on `(run_id, record_id, layer, artifact_type)`; `features_metrics` on `(run_id, record_id)`.
 
@@ -114,7 +114,7 @@ Metric values are written as DOUBLE PRECISION without rounding; formatting/round
 - **Invalid record filters** (e.g. malformed `RECORD_RANGE`) → `aggregation_filter_invalid`, exit 1. **Filters provided but intersection with processing artifacts empty** → `aggregation_no_records_after_filter`, `status='failed'`, exit 1.
 - **No processing artifacts** for the run (ingestion only, or empty run) → `aggregation_no_processing_records`, `status='succeeded'`, exit 0; no Spark run, no features written.
 - **Spark read or write failure** (e.g. missing Parquet, S3A error) → `status='failed'`, log `aggregation_spark_read_failed` or `aggregation_spark_write_failed`, exit 1.
-- **Output already exists and overwrite disabled** → run skipped, log `aggregation_skip` reason=`object_exists`, exit 0.
+- **Output already exists and overwrite disabled** → run skipped, log `aggregation_skip` reason=`object_exists`, exit 0. If this was a failed or partial write (e.g. some part files but no `_SUCCESS`), rerun with `AGG_OVERWRITE=1` to force recompute.
 
 ---
 

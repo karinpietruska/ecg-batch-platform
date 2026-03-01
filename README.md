@@ -493,6 +493,8 @@ docker compose run --rm aggregation
 - **`AGG_OVERWRITE=false`** (default): if the run-level features path already exists in MinIO, the **entire run** is skipped (logged as `aggregation_skip`, scope=run); no record discovery or filter evaluation is performed.
 - **`AGG_OVERWRITE=true`**: existing run-level features are recomputed and overwritten; `artifacts` and `features_metrics` are upserted. If you want filter validation to execute for an existing output, set `AGG_OVERWRITE=true`; otherwise the job will skip before evaluating filters.
 
+If a run crashes mid-write and you rerun without `AGG_OVERWRITE`, it may skip due to partial outputs (any object under the prefix counts as "exists"); use `AGG_OVERWRITE=1` to force recompute.
+
 Example overwrite:
 
 ```bash

@@ -81,7 +81,9 @@ def object_exists(s3_client, bucket: str, key: str) -> bool:
 
 
 def prefix_exists(s3_client, bucket: str, prefix: str) -> bool:
-    """Return True if any object exists with the given prefix (e.g. Spark writes a directory)."""
+    """Return True if any object exists with the given prefix (e.g. Spark writes a directory with part files).
+    Prefix-based: treats any object under the path as 'exists'. For strict 'complete output' you could
+    check for prefix/_SUCCESS; current behavior can treat partial/incomplete writes as exists."""
     try:
         resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
         return resp.get("KeyCount", 0) > 0
@@ -172,6 +174,7 @@ def build_spark_session() -> SparkSession:
 
 
 def s3a_path(bucket: str, key: str) -> str:
+    """Build S3A path. DB artifact.uri is object key only (no scheme); processing/ingestion store keys like processing/run_date=.../..."""
     return f"s3a://{bucket}/{key}"
 
 
@@ -249,6 +252,10 @@ def main() -> int:
                 reason="object_exists",
                 scope="run",
             )
+            print(
+                "Skipped because output prefix exists. If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
+                flush=True,
+            )
             return 0
 
         # Discover processing artifacts
@@ -280,6 +287,7 @@ def main() -> int:
         else:
             record_list = sorted(discovered_ids.intersection(filter_ids))
             if not record_list:
+                # Same as processing: empty intersection with filters → failed, exit 1 (user misconfiguration)
                 upsert_service_run(
                     cur,
                     run_id,
@@ -308,11 +316,12 @@ def main() -> int:
         try:
             df = spark.read.parquet(*paths)
         except Exception as e:
+            exc_class = type(e).__name__
             upsert_service_run(
                 cur,
                 run_id,
                 status="failed",
-                notes=f"Spark read failed: {str(e)[:400]}",
+                notes=f"Spark read failed: {exc_class}: {str(e)[:380]}",
                 set_started=False,
                 set_ended=True,
             )
@@ -348,11 +357,12 @@ def main() -> int:
         try:
             features_df.write.mode("overwrite").parquet(out_path)
         except Exception as e:
+            exc_class = type(e).__name__
             upsert_service_run(
                 cur,
                 run_id,
                 status="failed",
-                notes=f"Spark write failed: {str(e)[:400]}",
+                notes=f"Spark write failed: {exc_class}: {str(e)[:380]}",
                 set_started=False,
                 set_ended=True,
             )
