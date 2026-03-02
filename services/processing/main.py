@@ -6,7 +6,7 @@ writes rr_intervals_v1 artifacts, and records processing metrics.
 """
 import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 import tempfile
 
 import boto3
@@ -315,7 +315,7 @@ def upsert_service_run(cur, run_id: str, status: str, notes: str | None, set_sta
         ON CONFLICT (run_id, service)
         DO UPDATE SET {", ".join(fields)}
         """,
-        (run_id, "processing", status, notes, datetime.utcnow(), None),
+        (run_id, "processing", status, notes, datetime.now(UTC), None),
     )
 
 
