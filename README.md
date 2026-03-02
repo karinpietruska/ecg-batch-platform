@@ -103,6 +103,14 @@ docker compose exec postgres psql -U ecg -d ecg_metadata -c \
 
 (Ingestion writes to `runs`; processing and aggregation write to `service_runs`. Use synthetic mode by default; for WFDB, set `USE_SYNTHETIC_DATA=false` and ensure MIT-BIH data is mounted.)
 
+Alternatively, you can run the full pipeline via the Layer 0 orchestrator:
+
+```bash
+cd ~/projects/ecg-batch-platform
+RUN_DATE=2026-03-16 RECORD_IDS=100,101 \
+./scripts/run_orchestrator.sh
+```
+
 ---
 
 ## Current state & next extensions

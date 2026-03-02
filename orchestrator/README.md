@@ -12,6 +12,8 @@ The orchestrator fails fast: if any service returns a non-zero exit code, execut
 
 The orchestrator does not inspect the database directly; it relies on each service's exit code and the `service_runs` table those services write.
 
+This orchestrator runs on the host and invokes `docker compose run` for each service; it is not containerized to avoid Docker-socket coupling.
+
 ---
 
 ## Responsibilities
@@ -33,7 +35,7 @@ docker compose up -d postgres minio minio-bootstrap
 Run full pipeline (synthetic default):
 
 ```bash
-docker compose run --rm orchestrator
+./scripts/run_orchestrator.sh
 ```
 
 Typical invocation with explicit date and record selection:
@@ -41,7 +43,7 @@ Typical invocation with explicit date and record selection:
 ```bash
 # Example: run full pipeline for a given date and record selection
 RUN_DATE=2026-03-15 RECORD_IDS=100,101 \
-docker compose run --rm orchestrator
+./scripts/run_orchestrator.sh
 ```
 
 **When aggregation skips:** If the orchestrator invokes aggregation and the service skips (output prefix already exists), surface a hint to the user: *"Skipped because output prefix exists. If this was a failed/partial output, rerun with AGG_OVERWRITE=1."* (The aggregation service itself also prints this when it skips.)
