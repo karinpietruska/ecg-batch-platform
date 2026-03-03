@@ -374,9 +374,20 @@ def main() -> int:
             F.sqrt(F.avg(F.col("diff_ms") * F.col("diff_ms"))).alias("rmssd_ms"),
             F.avg(F.when(F.abs(F.col("diff_ms")) > 50, 1).otherwise(0)).alias("pnn50"),
             F.count(F.col("diff_ms")).alias("n_rr"),
+            F.min("t_peak_sec").alias("window_first_peak_sec"),
+            F.max("t_peak_sec").alias("window_last_peak_sec"),
         ).withColumn(
             "window_valid",
             F.col("n_rr") >= F.lit(30),
+        ).withColumn(
+            "window_coverage_sec",
+            F.col("window_last_peak_sec") - F.col("window_first_peak_sec"),
+        ).withColumn(
+            "window_is_partial",
+            F.col("window_coverage_sec") < F.lit(300.0 - 1e-6),
+        ).drop(
+            "window_first_peak_sec",
+            "window_last_peak_sec",
         )
 
         # Write one curated dataset prefix per record and register curated artifacts.

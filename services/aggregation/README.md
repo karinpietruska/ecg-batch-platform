@@ -101,6 +101,8 @@ Metric values are written as DOUBLE PRECISION without rounding; formatting/round
 - Other records in the same run are still processed.
 - If all selected records already exist and `AGG_OVERWRITE=false`, aggregation exits 0 and logs `reason='all_records_exist'`.
 
+`window_coverage_sec` measures observed R-peak span inside each 5-minute bin (`max(t_peak_sec) - min(t_peak_sec)`). Because R-peaks rarely align exactly with bin boundaries, coverage may be `< 300s` even for well-populated windows. Downstream consumers should apply a coverage threshold (for example `>=270s` or `>=290s`) rather than expecting exact `300s`.
+
 ---
 
 ## Run lifecycle

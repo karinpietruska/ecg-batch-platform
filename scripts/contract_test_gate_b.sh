@@ -153,6 +153,8 @@ required_cols = {
     "window_end_sec",
     "n_rr",
     "window_valid",
+    "window_coverage_sec",
+    "window_is_partial",
     "mean_rr_ms",
     "sdnn_ms",
     "rmssd_ms",
@@ -174,6 +176,29 @@ if actual_rows == 0:
 for w in window_starts:
     if abs(float(w) % 300.0) > 1e-9:
         raise SystemExit(f"FAIL: window_start_sec not aligned to 300s: {w}")
+
+# Validate coverage semantics and partial flag consistency.
+for key in parquet_keys:
+    o = s3.get_object(Bucket=bucket, Key=key)
+    t = pq.read_table(pa.BufferReader(o["Body"].read()))
+    cov = t.column("window_coverage_sec")
+    partial = t.column("window_is_partial")
+    for i in range(t.num_rows):
+        cov_val = cov[i].as_py()
+        part_val = partial[i].as_py()
+        if cov_val is None or part_val is None:
+            raise SystemExit("FAIL: window_coverage_sec/window_is_partial contains nulls")
+        cov_f = float(cov_val)
+        if cov_f < 0.0:
+            raise SystemExit(f"FAIL: negative window_coverage_sec: {cov_f}")
+        if cov_f > 300.0 + 1e-6:
+            raise SystemExit(f"FAIL: window_coverage_sec exceeds 300s window: {cov_f}")
+        expected_partial = cov_f < (300.0 - 1e-6)
+        if bool(part_val) != expected_partial:
+            raise SystemExit(
+                f"FAIL: window_is_partial inconsistent with window_coverage_sec "
+                f"(coverage={cov_f}, partial={part_val}, expected_partial={expected_partial})"
+            )
 
 if actual_rows != expected_windows:
     raise SystemExit(
