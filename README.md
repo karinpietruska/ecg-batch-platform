@@ -11,6 +11,11 @@ Batch-based data pipeline for ECG time-series: ingestion (WFDB/MIT-BIH), process
 
 **Status ownership:** `runs.status` is owned by ingestion. `service_runs.status` is owned by processing and aggregation. The **`artifacts`** table is the lineage backbone: it links run_id, record_id, layer, and artifact location so downstream services know what to read. Downstream services never assume file paths; they discover inputs exclusively via `artifacts`.
 
+**Run-level records:**
+
+- `runs`: one row per `run_id`, created/updated by ingestion.
+- `service_runs`: one row per service per `run_id` (processing, aggregation, etc.).
+
 ```
 Ingestion → artifacts → Processing → artifacts → Aggregation
       |                       |                         |

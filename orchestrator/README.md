@@ -6,7 +6,7 @@
 
 The orchestrator is the control plane for the pipeline. It generates a unique **run_id** and **run_date** for each execution and triggers the services in order: ingestion → processing → aggregation.
 
-It operates as a **CLI or cron-triggered job** (e.g. via Docker Compose) and passes run context to each service via environment variables.
+It operates as a **CLI or cron-triggered host process** and invokes `docker compose run` for each service, passing run context via environment variables.
 
 The orchestrator fails fast: if any service returns a non-zero exit code, execution stops immediately and that exit code is returned.
 
@@ -71,6 +71,34 @@ The orchestrator sets (or reads from its environment) and passes to each service
 The orchestrator forwards record-selection and overwrite flags (e.g. `RECORD_*`, `DEV_*`, `AGG_OVERWRITE`) to downstream services unchanged.
 
 For development, the pipeline can be triggered manually; for production, a cron container or scheduler can invoke the orchestrator at the desired frequency (e.g. weekly).
+
+---
+
+## Scheduling (host cron / CI)
+
+In production, the orchestrator is typically invoked by a scheduler (host cron, CI, or Airflow) rather than run manually.
+
+`RUN_DATE` defaults to the current **UTC** date when not provided. The scheduler host must have `docker` (with the `docker compose` plugin) and `python3` available on `PATH`, and must run commands from the repository root.
+
+Example **host cron** entry (daily at 02:00, using UTC date by default):
+
+```cron
+0 2 * * * cd /home/karin/projects/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
+```
+
+`scripts/scheduled_orchestrator.sh`:
+
+- Resolves the repo root and logs it.
+- Verifies `python3`, `docker`, and `docker compose` are available.
+- Sets `RUN_DATE` to `$(date -u +%F)` if not provided.
+- Writes logs to `logs/orchestrator_<RUN_DATE>_<UTC_TIMESTAMP>.log`.
+- Propagates the orchestrator's exit code so cron/CI can detect failed runs.
+
+You can override record selection or overwrite flags by setting env vars in the cron entry, e.g.:
+
+```cron
+0 2 * * * cd /home/karin/projects/ecg-batch-platform && RECORD_RANGE=100-124 RECORD_LIMIT=10 ./scripts/scheduled_orchestrator.sh
+```
 
 ---
 
