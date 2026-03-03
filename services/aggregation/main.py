@@ -1,9 +1,9 @@
 """
-Aggregation service – HRV features (Spark + S3A)
+Aggregation service – curated 5-minute HRV windows (Spark + S3A)
 
-Discovers processing rr_intervals artifacts for a run, reads them via Spark from MinIO (S3A),
-computes per-record HRV metrics (mean_rr_ms, sdnn_ms, rmssd_ms, pnn50, n_rr), writes a run-level
-features.parquet, and upserts artifacts + features_metrics.
+Discovers canonical processed rr_intervals_v1 artifacts for a run, reads them via Spark from MinIO (S3A),
+computes per-record 5-minute window HRV metrics, writes curated window_features_v1 datasets, and upserts
+curated artifacts.
 """
 import os
 import sys
@@ -38,9 +38,9 @@ RECORD_LIMIT_RAW = os.environ.get("RECORD_LIMIT")
 _OVERWRITE_RAW = (os.environ.get("AGG_OVERWRITE", "false") or "false").strip().lower()
 AGG_OVERWRITE = _OVERWRITE_RAW in ("1", "true", "yes", "y", "on")
 
-# Run-level output path (single dataset per run)
-def aggregation_output_key(run_date: str, run_id: str) -> str:
-    return f"aggregation/run_date={run_date}/run_id={run_id}/features.parquet"
+def curated_output_key(run_date: str, run_id: str, record_id: str) -> str:
+    """Per-record curated output prefix."""
+    return f"curated/run_date={run_date}/run_id={run_id}/record_id={record_id}/window_features_v1.parquet/"
 
 
 def log_structured(**kwargs):
@@ -238,30 +238,7 @@ def main() -> int:
         conn.autocommit = False
         cur = conn.cursor()
 
-        # Run-level idempotency: Spark writes a directory (prefix); if any object under it exists and overwrite=false, skip
-        out_key = aggregation_output_key(run_date, run_id)
         s3_client = get_s3_client()
-        if prefix_exists(s3_client, MINIO_BUCKET, out_key) and not AGG_OVERWRITE:
-            upsert_service_run(
-                cur,
-                run_id,
-                status="succeeded",
-                notes="skipped; run-level features.parquet already exists",
-                set_started=True,
-                set_ended=True,
-            )
-            conn.commit()
-            log_structured(
-                event="aggregation_skip",
-                run_id=run_id,
-                reason="object_exists",
-                scope="run",
-            )
-            print(
-                "Skipped because output prefix exists. If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
-                flush=True,
-            )
-            return 0
 
         # Discover canonical processed RR artifacts
         candidates = discover_processing_artifacts(conn, run_id)
@@ -309,13 +286,50 @@ def main() -> int:
 
         # Keep only candidates that are in record_list (preserve uri)
         candidate_map = {c["record_id"]: c["uri"] for c in candidates if c["record_id"] in set(record_list)}
-        paths = [s3a_path(MINIO_BUCKET, candidate_map[rid]) for rid in record_list]
+        skipped_ids: list[str] = []
+        compute_ids: list[str] = []
+        for rid in record_list:
+            out_key = curated_output_key(run_date, run_id, rid)
+            if not AGG_OVERWRITE and prefix_exists(s3_client, MINIO_BUCKET, out_key):
+                skipped_ids.append(rid)
+                log_structured(
+                    event="aggregation_skip_record",
+                    run_id=run_id,
+                    record_id=rid,
+                    reason="object_exists",
+                )
+            else:
+                compute_ids.append(rid)
+
+        if not compute_ids:
+            notes = (
+                f"records_total={len(record_list)},records_ok=0,records_failed=0,"
+                f"records_skipped={len(skipped_ids)},windows_total=0"
+            )
+            upsert_service_run(
+                cur,
+                run_id,
+                status="succeeded",
+                notes=notes,
+                set_started=True,
+                set_ended=True,
+            )
+            conn.commit()
+            log_structured(event="aggregation_skip", run_id=run_id, reason="all_records_exist", scope="record")
+            print(
+                "All selected records skipped because curated output prefixes exist. "
+                "If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
+                flush=True,
+            )
+            return 0
+
+        paths = [s3a_path(MINIO_BUCKET, candidate_map[rid]) for rid in compute_ids]
 
         # service_runs: running
-        upsert_service_run(cur, run_id, status="running", notes="aggregation HRV v1", set_started=True, set_ended=False)
+        upsert_service_run(cur, run_id, status="running", notes="aggregation curated windows v1", set_started=True, set_ended=False)
         conn.commit()
 
-        # Spark: read rr_intervals, compute HRV metrics, write run-level features.parquet
+        # Spark: read rr_intervals, compute 5-minute curated window features
         from pyspark.sql import functions as F
         from pyspark.sql.window import Window
 
@@ -336,33 +350,65 @@ def main() -> int:
             log_structured(event="aggregation_spark_read_failed", run_id=run_id, error=str(e))
             return 1
 
-        # Valid RR only; rr_ms in milliseconds
+        # Valid RR only; rr_ms in milliseconds and deterministic 5-minute tumbling windows.
         df_valid = df.filter(F.col("rr_interval_sec").isNotNull()).withColumn(
             "rr_ms", F.col("rr_interval_sec") * 1000
         )
-        # Successive difference within each record (ordered by beat_index)
-        w = Window.partitionBy("run_id", "record_id").orderBy("beat_index")
+        df_valid = df_valid.filter(F.col("t_peak_sec").isNotNull()).withColumn(
+            "window_start_sec",
+            F.floor(F.col("t_peak_sec") / F.lit(300.0)) * F.lit(300.0),
+        ).withColumn(
+            "window_end_sec",
+            F.col("window_start_sec") + F.lit(300.0),
+        )
+        # Successive differences are computed per record AND per window.
+        w = Window.partitionBy("run_id", "record_id", "window_start_sec").orderBy("beat_index")
         df_valid = df_valid.withColumn("diff_ms", F.col("rr_ms") - F.lag("rr_ms", 1).over(w))
 
-        # Per-record HRV: mean_rr_ms, sdnn_ms (ms), rmssd_ms, pnn50 (0..1), n_rr = count(diff_ms)
-        features_agg = df_valid.groupBy("run_id", "run_date", "record_id").agg(
+        # Per-window curated HRV features.
+        curated_df = df_valid.groupBy(
+            "run_id", "run_date", "record_id", "window_start_sec", "window_end_sec"
+        ).agg(
             F.avg("rr_ms").alias("mean_rr_ms"),
             F.stddev_samp("rr_ms").alias("sdnn_ms"),
             F.sqrt(F.avg(F.col("diff_ms") * F.col("diff_ms"))).alias("rmssd_ms"),
             F.avg(F.when(F.abs(F.col("diff_ms")) > 50, 1).otherwise(0)).alias("pnn50"),
             F.count(F.col("diff_ms")).alias("n_rr"),
+        ).withColumn(
+            "window_valid",
+            F.col("n_rr") >= F.lit(30),
         )
 
-        # One row per record (include records with no valid RR → all metrics null)
-        ref_df = spark.createDataFrame(
-            [(run_id, run_date, rid) for rid in record_list],
-            ["run_id", "run_date", "record_id"],
-        )
-        features_df = ref_df.join(features_agg, ["run_id", "run_date", "record_id"], "left")
+        # Write one curated dataset prefix per record and register curated artifacts.
+        window_counts = {
+            row["record_id"]: int(row["count"])
+            for row in curated_df.groupBy("record_id").count().collect()
+        }
+        windows_total = int(sum(window_counts.values()))
+        records_with_windows = sorted(window_counts.keys())
 
-        out_path = s3a_path(MINIO_BUCKET, out_key)
         try:
-            features_df.write.mode("overwrite").parquet(out_path)
+            for record_id in compute_ids:
+                if window_counts.get(record_id, 0) == 0:
+                    continue
+                out_key = curated_output_key(run_date, run_id, record_id)
+                out_path = s3a_path(MINIO_BUCKET, out_key)
+                (
+                    curated_df
+                    .filter(F.col("record_id") == F.lit(record_id))
+                    .write
+                    .mode("overwrite")
+                    .parquet(out_path)
+                )
+                cur.execute(
+                    """
+                    INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, record_id, layer, artifact_type)
+                    DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
+                    """,
+                    (run_id, record_id, "curated", "window_features_v1", out_key, "window_features_v1"),
+                )
         except Exception as e:
             exc_class = type(e).__name__
             upsert_service_run(
@@ -377,42 +423,12 @@ def main() -> int:
             log_structured(event="aggregation_spark_write_failed", run_id=run_id, error=str(e))
             return 1
 
-        # Option B: one artifact row per record, same uri; features_metrics from computed DF
-        for row in features_df.collect():
-            record_id = row.record_id
-            mean_rr_ms = float(row.mean_rr_ms) if row.mean_rr_ms is not None else None
-            sdnn_ms = float(row.sdnn_ms) if row.sdnn_ms is not None else None
-            rmssd_ms = float(row.rmssd_ms) if row.rmssd_ms is not None else None
-            pnn50_val = float(row.pnn50) if row.pnn50 is not None else None
-            n_rr_val = int(row.n_rr) if row.n_rr is not None else None
-
-            cur.execute(
-                """
-                INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (run_id, record_id, layer, artifact_type)
-                DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
-                """,
-                (run_id, record_id, "aggregation", "features", out_key, "features_v1"),
-            )
-            cur.execute(
-                """
-                INSERT INTO features_metrics (run_id, record_id, mean_rr_ms, sdnn_ms, rmssd_ms, pnn50, n_rr)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (run_id, record_id)
-                DO UPDATE SET
-                    mean_rr_ms = EXCLUDED.mean_rr_ms,
-                    sdnn_ms = EXCLUDED.sdnn_ms,
-                    rmssd_ms = EXCLUDED.rmssd_ms,
-                    pnn50 = EXCLUDED.pnn50,
-                    n_rr = EXCLUDED.n_rr,
-                    created_at = NOW()
-                """,
-                (run_id, record_id, mean_rr_ms, sdnn_ms, rmssd_ms, pnn50_val, n_rr_val),
-            )
-
-        n_ok = len(record_list)
-        notes = f"records_total={n_ok},records_ok={n_ok},records_failed=0"
+        n_ok = len(compute_ids)
+        notes = (
+            f"records_total={len(record_list)},records_ok={n_ok},records_failed=0,"
+            f"records_skipped={len(skipped_ids)},records_with_windows={len(records_with_windows)},"
+            f"windows_total={windows_total}"
+        )
         upsert_service_run(cur, run_id, status="succeeded", notes=notes, set_started=False, set_ended=True)
         conn.commit()
 
@@ -420,9 +436,12 @@ def main() -> int:
             event="aggregation_end",
             run_id=run_id,
             status="succeeded",
-            records_total=n_ok,
+            records_total=len(record_list),
             records_ok=n_ok,
             records_failed=0,
+            records_skipped=len(skipped_ids),
+            records_with_windows=len(records_with_windows),
+            windows_total=windows_total,
             overwrite="true" if AGG_OVERWRITE else "false",
         )
         return 0

@@ -83,28 +83,34 @@ Metric values are written as DOUBLE PRECISION without rounding; formatting/round
 
 **Infrastructure:** `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`; `MINIO_ENDPOINT`, `MINIO_BUCKET`; `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (MinIO credentials).
 
-**Record selection:** `RECORD_IDS`, `RECORD_RANGE`, `RECORD_LIMIT` (same semantics as processing; intersection with discovered processing artifacts). If filters are set and the intersection is empty → run fails. If no filters are set and there are no processing artifacts → run succeeds with "no processing artifacts found".
+**Record selection:** `RECORD_IDS`, `RECORD_RANGE`, `RECORD_LIMIT` (same semantics as processing; intersection with discovered processing artifacts). If filters are set and the intersection is empty → run fails. If canonical processed RR artifacts are missing for the run → run fails.
 
-**Idempotency:** `AGG_OVERWRITE` — `false` (default): skip run if run-level features path exists; `true`: recompute and overwrite.
+**Idempotency:** `AGG_OVERWRITE` — `false` (default): apply per-record skip when curated output exists; `true`: recompute and overwrite.
 
 ---
 
 ## Idempotency and lifecycle
 
-- **Run-level:** If any object exists under `aggregation/run_date=.../run_id=.../features.parquet` and `AGG_OVERWRITE=false`, the service skips the run (logs `aggregation_skip`, scope=run) and exits 0. **Note:** Run-level idempotency is evaluated *before* record discovery and filter validation. If the run-level features dataset already exists and overwrite is disabled, the service skips without evaluating filters. To force filter validation or recomputation for an existing run, set `AGG_OVERWRITE=true`. **Partial output:** Existence is prefix-based (any object under the path counts). If a run crashes mid-write and you rerun without `AGG_OVERWRITE`, it may skip due to partial outputs; use `AGG_OVERWRITE=1` to force recompute.
 - **service_runs:** At start, upsert `status='running'`; at end, set `status` (`succeeded` / `failed`), `ended_at`, and `notes` with counts. Exit code 0 when no records failed.
-- **DB upserts:** `artifacts` and `features_metrics` are written via upserts (`ON CONFLICT DO UPDATE`). Uniqueness: `artifacts` on `(run_id, record_id, layer, artifact_type)`; `features_metrics` on `(run_id, record_id)`.
+- **DB upserts:** Curated `artifacts` are written via upserts (`ON CONFLICT DO UPDATE`). Uniqueness: `artifacts` on `(run_id, record_id, layer, artifact_type)`.
+
+### Curated idempotency semantics (`window_features_v1`)
+
+- Idempotency is enforced per record.
+- For each (`run_id`, `record_id`): if curated prefix exists and `AGG_OVERWRITE=false`, the record is skipped.
+- Other records in the same run are still processed.
+- If all selected records already exist and `AGG_OVERWRITE=false`, aggregation exits 0 and logs `reason='all_records_exist'`.
 
 ---
 
 ## Run lifecycle
 
 1. Upsert `service_runs` with `service='aggregation'`, `status='running'`, `started_at=NOW()`.
-2. If run-level features path exists in MinIO and `AGG_OVERWRITE=false` → skip run, set `status='succeeded'`, log `aggregation_skip`, exit 0. (Idempotency is checked before discovery/filters.)
-3. Discover processing artifacts from `artifacts` (layer `processing`, artifact_type `rr_intervals`, schema_ver `rr_intervals_v1` from processing) for the given `run_id`.
-4. Resolve optional filters (`RECORD_IDS` / `RECORD_RANGE` / `RECORD_LIMIT`): intersect with discovered set. If filters provided and intersection empty → `status='failed'`, log `aggregation_no_records_after_filter`, exit 1. If no filters and no processing artifacts → `status='succeeded'`, notes "no processing artifacts found", log `aggregation_no_processing_records`, exit 0.
-5. Read RR-interval Parquet from MinIO via Spark S3A, compute HRV per record, write run-level `features.parquet`.
-6. Upsert `artifacts` (layer `aggregation`, artifact_type `features`) and `features_metrics`; update `service_runs` to `status='succeeded'` with counts. Exit 0. On Spark read/write failure → `status='failed'`, exit 1.
+2. Discover processing artifacts from `artifacts` (layer `processed`, artifact_type `rr_intervals_v1`, schema_ver `rr_intervals_v1`) for the given `run_id`. If none exist, fail.
+3. Resolve optional filters (`RECORD_IDS` / `RECORD_RANGE` / `RECORD_LIMIT`): intersect with discovered set. If filters provided and intersection empty → `status='failed'`, log `aggregation_no_records_after_filter`, exit 1.
+4. Apply per-record idempotency check on curated output prefixes when `AGG_OVERWRITE=false`; existing records are skipped.
+5. Read RR-interval Parquet from MinIO via Spark S3A, compute 5-minute window features, write per-record curated `window_features_v1` datasets.
+6. Upsert curated `artifacts` rows (`layer='curated'`, `artifact_type='window_features_v1'`); update `service_runs` to `status='succeeded'` with counts. Exit 0. On Spark read/write failure → `status='failed'`, exit 1.
 
 ---
 
@@ -112,9 +118,9 @@ Metric values are written as DOUBLE PRECISION without rounding; formatting/round
 
 - **Run row missing:** Aggregation assumes the run row exists (created by ingestion). If missing, FK constraints will cause the service to fail.
 - **Invalid record filters** (e.g. malformed `RECORD_RANGE`) → `aggregation_filter_invalid`, exit 1. **Filters provided but intersection with processing artifacts empty** → `aggregation_no_records_after_filter`, `status='failed'`, exit 1.
-- **No processing artifacts** for the run (ingestion only, or empty run) → `aggregation_no_processing_records`, `status='succeeded'`, exit 0; no Spark run, no features written.
+- **No canonical processed RR artifacts** for the run → `aggregation_no_processed_rr_artifacts`, `status='failed'`, exit 1.
 - **Spark read or write failure** (e.g. missing Parquet, S3A error) → `status='failed'`, log `aggregation_spark_read_failed` or `aggregation_spark_write_failed`, exit 1.
-- **Output already exists and overwrite disabled** → run skipped, log `aggregation_skip` reason=`object_exists`, exit 0. If this was a failed or partial write (e.g. some part files but no `_SUCCESS`), rerun with `AGG_OVERWRITE=1` to force recompute.
+- **Output already exists and overwrite disabled** → affected records are skipped (`aggregation_skip_record`). If all selected records exist, run exits 0 with `aggregation_skip` reason=`all_records_exist`. If this was a failed or partial write (e.g. some part files but no `_SUCCESS`), rerun with `AGG_OVERWRITE=1` to force recompute.
 
 ---
 
@@ -134,8 +140,8 @@ From the project root, run the aggregation CLI test script:
 ./scripts/aggregation_tests.sh
 ```
 
-The script validates: full pipeline (ingestion → processing → aggregation) with DB checks; idempotency (skip, then overwrite, then skip); invalid `RECORD_IDS` (filter empty intersection → failed); run with only ingestion (no processing artifacts → succeeded, no Spark); empty run (manual run row, no artifacts → no_processing_records, succeeded); artifact consistency (aggregation artifact count = features_metrics count, single run-level URI).
+The script validates: full pipeline (ingestion → processing → aggregation) with DB checks; idempotency (skip, then overwrite, then skip); invalid `RECORD_IDS` (filter empty intersection → failed); missing canonical processed input (aggregation fails as expected); and curated artifact consistency (`layer='curated'`, `artifact_type='window_features_v1'`).
 
 ## Status
 
-This service computes HRV features from processing `rr_intervals` and writes run-level Parquet plus `features_metrics`. It is operational once processing has produced `rr_intervals` artifacts and the aggregation image is built. S3A is used to read/write MinIO.
+This service computes 5-minute HRV window features from processing `rr_intervals_v1` and writes curated per-record datasets plus curated artifact lineage. It is operational once processing has produced canonical processed RR artifacts and the aggregation image is built. S3A is used to read/write MinIO.
