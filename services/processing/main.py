@@ -302,11 +302,13 @@ def upsert_service_run(cur, run_id: str, status: str, notes: str | None, set_sta
     fields = ["status = EXCLUDED.status", "notes = EXCLUDED.notes"]
     timestamps = []
     if set_started:
-        timestamps.append("started_at = NOW()")
+        timestamps.append("started_at = EXCLUDED.started_at")
     if set_ended:
-        timestamps.append("ended_at = NOW()")
+        timestamps.append("ended_at = COALESCE(service_runs.ended_at, EXCLUDED.ended_at)")
     if timestamps:
         fields.extend(timestamps)
+    started_ts = datetime.now(UTC) if set_started else None
+    ended_ts = datetime.now(UTC) if set_ended else None
 
     cur.execute(
         f"""
@@ -315,7 +317,7 @@ def upsert_service_run(cur, run_id: str, status: str, notes: str | None, set_sta
         ON CONFLICT (run_id, service)
         DO UPDATE SET {", ".join(fields)}
         """,
-        (run_id, "processing", status, notes, datetime.now(UTC), None),
+        (run_id, "processing", status, notes, started_ts, ended_ts),
     )
 
 
@@ -421,8 +423,8 @@ def main() -> int:
         for record_id in record_ids:
             raw_key = f"raw/run_date={run_date}/run_id={run_id}/record_id={record_id}/ecg.parquet"
             proc_key = (
-                f"processing/run_date={run_date}/run_id={run_id}/"
-                f"record_id={record_id}/rr_intervals.parquet"
+                f"processed/run_date={run_date}/run_id={run_id}/"
+                f"record_id={record_id}/rr_intervals_v1.parquet"
             )
 
             # Idempotency: skip if processing artifact exists and overwrite is false
@@ -454,7 +456,7 @@ def main() -> int:
                     ON CONFLICT (run_id, record_id, layer, artifact_type)
                     DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
                     """,
-                    (run_id, record_id, "processing", "rr_intervals", proc_key, "rr_intervals_v1"),
+                    (run_id, record_id, "processed", "rr_intervals_v1", proc_key, "rr_intervals_v1"),
                 )
                 # Upsert processing_metrics row
                 cur.execute(

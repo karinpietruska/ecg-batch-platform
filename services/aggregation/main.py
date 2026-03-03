@@ -134,13 +134,16 @@ def resolve_record_filters() -> set[str] | None:
 
 
 def discover_processing_artifacts(conn, run_id: str) -> list[dict]:
-    """Return list of {record_id, uri} for layer=processing, artifact_type=rr_intervals."""
+    """Return canonical RR artifacts for aggregation input (processed/rr_intervals_v1)."""
     cur = conn.cursor()
     cur.execute(
         """
         SELECT record_id, uri
         FROM artifacts
-        WHERE run_id = %s AND layer = 'processing' AND artifact_type = 'rr_intervals'
+        WHERE run_id = %s
+          AND layer = 'processed'
+          AND artifact_type = 'rr_intervals_v1'
+          AND schema_ver = 'rr_intervals_v1'
         ORDER BY record_id
         """,
         (run_id,),
@@ -182,11 +185,13 @@ def upsert_service_run(cur, run_id: str, status: str, notes: str | None, set_sta
     fields = ["status = EXCLUDED.status", "notes = EXCLUDED.notes"]
     timestamps = []
     if set_started:
-        timestamps.append("started_at = NOW()")
+        timestamps.append("started_at = EXCLUDED.started_at")
     if set_ended:
-        timestamps.append("ended_at = NOW()")
+        timestamps.append("ended_at = COALESCE(service_runs.ended_at, EXCLUDED.ended_at)")
     if timestamps:
         fields.extend(timestamps)
+    started_ts = datetime.now(UTC) if set_started else None
+    ended_ts = datetime.now(UTC) if set_ended else None
     cur.execute(
         f"""
         INSERT INTO service_runs (run_id, service, status, notes, started_at, ended_at)
@@ -194,7 +199,7 @@ def upsert_service_run(cur, run_id: str, status: str, notes: str | None, set_sta
         ON CONFLICT (run_id, service)
         DO UPDATE SET {", ".join(fields)}
         """,
-        (run_id, "aggregation", status, notes, datetime.now(UTC), None),
+        (run_id, "aggregation", status, notes, started_ts, ended_ts),
     )
 
 
@@ -258,9 +263,23 @@ def main() -> int:
             )
             return 0
 
-        # Discover processing artifacts
+        # Discover canonical processed RR artifacts
         candidates = discover_processing_artifacts(conn, run_id)
         discovered_ids = {c["record_id"] for c in candidates}
+
+        # Contract rule: if no canonical processed RR artifacts exist for run_id, fail (exit 1)
+        if not discovered_ids:
+            upsert_service_run(
+                cur,
+                run_id,
+                status="failed",
+                notes="no canonical processed RR artifacts found for aggregation",
+                set_started=True,
+                set_ended=True,
+            )
+            conn.commit()
+            log_structured(event="aggregation_no_processed_rr_artifacts", run_id=run_id)
+            return 1
 
         try:
             filter_ids = resolve_record_filters()
@@ -272,18 +291,6 @@ def main() -> int:
 
         if filter_ids is None:
             record_list = sorted(discovered_ids)
-            if not record_list:
-                upsert_service_run(
-                    cur,
-                    run_id,
-                    status="succeeded",
-                    notes="no processing artifacts found for aggregation",
-                    set_started=False,
-                    set_ended=True,
-                )
-                conn.commit()
-                log_structured(event="aggregation_no_processing_records", run_id=run_id)
-                return 0
         else:
             record_list = sorted(discovered_ids.intersection(filter_ids))
             if not record_list:
