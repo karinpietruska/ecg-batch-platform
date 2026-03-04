@@ -37,10 +37,16 @@ RECORD_LIMIT_RAW = os.environ.get("RECORD_LIMIT")
 
 _OVERWRITE_RAW = (os.environ.get("AGG_OVERWRITE", "false") or "false").strip().lower()
 AGG_OVERWRITE = _OVERWRITE_RAW in ("1", "true", "yes", "y", "on")
+PERCENTILE_APPROX_ACCURACY = 10000
 
 def curated_output_key(run_date: str, run_id: str, record_id: str) -> str:
     """Per-record curated output prefix."""
     return f"curated/run_date={run_date}/run_id={run_id}/record_id={record_id}/window_features_v1.parquet/"
+
+
+def ml_ready_output_key(run_date: str, run_id: str) -> str:
+    """Run-level ML-ready output prefix."""
+    return f"ml_ready/run_date={run_date}/run_id={run_id}/record_features_v1.parquet/"
 
 
 def log_structured(**kwargs):
@@ -239,6 +245,31 @@ def main() -> int:
         cur = conn.cursor()
 
         s3_client = get_s3_client()
+        ml_ready_key = ml_ready_output_key(run_date, run_id)
+
+        # Gate C idempotency: if ml_ready output exists and overwrite=false, skip curated + ml_ready writes.
+        if prefix_exists(s3_client, MINIO_BUCKET, ml_ready_key) and not AGG_OVERWRITE:
+            upsert_service_run(
+                cur,
+                run_id,
+                status="succeeded",
+                notes="skipped; ml_ready output prefix already exists",
+                set_started=True,
+                set_ended=True,
+            )
+            conn.commit()
+            log_structured(
+                event="aggregation_skip",
+                run_id=run_id,
+                reason="object_exists",
+                scope="run",
+                target="ml_ready",
+            )
+            print(
+                "Skipped because ml_ready output prefix exists. If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
+                flush=True,
+            )
+            return 0
 
         # Discover canonical processed RR artifacts
         candidates = discover_processing_artifacts(conn, run_id)
@@ -301,32 +332,17 @@ def main() -> int:
             else:
                 compute_ids.append(rid)
 
-        if not compute_ids:
-            notes = (
-                f"records_total={len(record_list)},records_ok=0,records_failed=0,"
-                f"records_skipped={len(skipped_ids)},windows_total=0"
-            )
-            upsert_service_run(
-                cur,
-                run_id,
-                status="succeeded",
-                notes=notes,
-                set_started=True,
-                set_ended=True,
-            )
-            conn.commit()
-            log_structured(event="aggregation_skip", run_id=run_id, reason="all_records_exist", scope="record")
-            print(
-                "All selected records skipped because curated output prefixes exist. "
-                "If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
-                flush=True,
-            )
-            return 0
-
-        paths = [s3a_path(MINIO_BUCKET, candidate_map[rid]) for rid in compute_ids]
+        paths = [s3a_path(MINIO_BUCKET, candidate_map[rid]) for rid in record_list]
 
         # service_runs: running
-        upsert_service_run(cur, run_id, status="running", notes="aggregation curated windows v1", set_started=True, set_ended=False)
+        upsert_service_run(
+            cur,
+            run_id,
+            status="running",
+            notes="aggregation curated+ml_ready v1",
+            set_started=True,
+            set_ended=False,
+        )
         conn.commit()
 
         # Spark: read rr_intervals, compute 5-minute curated window features
@@ -350,20 +366,47 @@ def main() -> int:
             log_structured(event="aggregation_spark_read_failed", run_id=run_id, error=str(e))
             return 1
 
-        # Valid RR only; rr_ms in milliseconds and deterministic 5-minute tumbling windows.
-        df_valid = df.filter(F.col("rr_interval_sec").isNotNull()).withColumn(
+        # Canonical RR universe for Gate C: canonical rr_intervals_v1 rows, no extra outlier filtering.
+        rr_df = df.filter(F.col("rr_interval_sec").isNotNull()).withColumn(
             "rr_ms", F.col("rr_interval_sec") * 1000
         )
-        df_valid = df_valid.filter(F.col("t_peak_sec").isNotNull()).withColumn(
+        df_valid = rr_df.filter(F.col("t_peak_sec").isNotNull()).withColumn(
             "window_start_sec",
             F.floor(F.col("t_peak_sec") / F.lit(300.0)) * F.lit(300.0),
         ).withColumn(
             "window_end_sec",
             F.col("window_start_sec") + F.lit(300.0),
         )
-        # Successive differences are computed per record AND per window.
-        w = Window.partitionBy("run_id", "record_id", "window_start_sec").orderBy("beat_index")
-        df_valid = df_valid.withColumn("diff_ms", F.col("rr_ms") - F.lag("rr_ms", 1).over(w))
+        # Successive differences are computed deterministically.
+        if "beat_index" in df_valid.columns:
+            w_window = Window.partitionBy("run_id", "record_id", "window_start_sec").orderBy("t_peak_sec", "beat_index")
+            w_record = Window.partitionBy("run_id", "record_id").orderBy("t_peak_sec", "beat_index")
+        else:
+            # Strict submission behavior: fail if ties exist and no tie-breaker column is available.
+            tie_exists = (
+                df_valid.groupBy("run_id", "record_id", "t_peak_sec")
+                .count()
+                .filter(F.col("count") > 1)
+                .limit(1)
+                .count()
+                > 0
+            )
+            if tie_exists:
+                upsert_service_run(
+                    cur,
+                    run_id,
+                    status="failed",
+                    notes="t_peak_sec ties detected without deterministic tie-breaker column",
+                    set_started=False,
+                    set_ended=True,
+                )
+                conn.commit()
+                log_structured(event="aggregation_invariant_failed", run_id=run_id, detail="t_peak_sec ties")
+                return 1
+            w_window = Window.partitionBy("run_id", "record_id", "window_start_sec").orderBy("t_peak_sec")
+            w_record = Window.partitionBy("run_id", "record_id").orderBy("t_peak_sec")
+
+        df_valid = df_valid.withColumn("diff_ms", F.col("rr_ms") - F.lag("rr_ms", 1).over(w_window))
 
         # Per-window curated HRV features.
         curated_df = df_valid.groupBy(
@@ -373,7 +416,7 @@ def main() -> int:
             F.stddev_samp("rr_ms").alias("sdnn_ms"),
             F.sqrt(F.avg(F.col("diff_ms") * F.col("diff_ms"))).alias("rmssd_ms"),
             F.avg(F.when(F.abs(F.col("diff_ms")) > 50, 1).otherwise(0)).alias("pnn50"),
-            F.count(F.col("diff_ms")).alias("n_rr"),
+            F.count(F.col("rr_ms")).alias("n_rr"),
             F.min("t_peak_sec").alias("window_first_peak_sec"),
             F.max("t_peak_sec").alias("window_last_peak_sec"),
         ).withColumn(
@@ -390,7 +433,91 @@ def main() -> int:
             "window_last_peak_sec",
         )
 
-        # Write one curated dataset prefix per record and register curated artifacts.
+        # Record-level rollups from windows (weighted by per-window n_rr where required).
+        window_rollups = (
+            curated_df.groupBy("run_id", "run_date", "record_id")
+            .agg(
+                F.sum("n_rr").alias("window_n_rr_sum"),
+                F.sum(F.col("mean_rr_ms") * F.col("n_rr")).alias("mean_rr_wsum"),
+                F.sum(F.col("sdnn_ms") * F.col("n_rr")).alias("sdnn_wsum"),
+                F.sum(F.col("rmssd_ms") * F.col("n_rr")).alias("rmssd_wsum"),
+                F.sum(F.col("pnn50") * F.col("n_rr")).alias("pnn50_wsum"),
+                F.count(F.lit(1)).alias("window_count_total"),
+                F.sum(F.when(F.col("window_valid"), F.lit(1)).otherwise(F.lit(0))).alias("window_count_valid"),
+                F.stddev_samp(F.when(F.col("window_valid") & F.col("mean_rr_ms").isNotNull(), F.col("mean_rr_ms"))).alias(
+                    "mean_rr_window_std"
+                ),
+                F.stddev_samp(F.when(F.col("window_valid") & F.col("sdnn_ms").isNotNull(), F.col("sdnn_ms"))).alias(
+                    "sdnn_window_std"
+                ),
+                F.stddev_samp(F.when(F.col("window_valid") & F.col("rmssd_ms").isNotNull(), F.col("rmssd_ms"))).alias(
+                    "rmssd_window_std"
+                ),
+                F.avg(F.when(F.col("window_coverage_sec").isNotNull(), F.col("window_coverage_sec"))).alias(
+                    "mean_window_coverage_sec"
+                ),
+                F.min(F.when(F.col("window_coverage_sec").isNotNull(), F.col("window_coverage_sec"))).alias(
+                    "min_window_coverage_sec"
+                ),
+                F.avg(F.when(F.col("window_is_partial").isNotNull(), F.col("window_is_partial").cast("double"))).alias(
+                    "partial_window_fraction"
+                ),
+            )
+            .withColumn(
+                "mean_rr_ms",
+                F.when(F.col("window_n_rr_sum") > 0, F.col("mean_rr_wsum") / F.col("window_n_rr_sum")),
+            )
+            .withColumn(
+                "sdnn_ms",
+                F.when(F.col("window_n_rr_sum") > 0, F.col("sdnn_wsum") / F.col("window_n_rr_sum")),
+            )
+            .withColumn(
+                "rmssd_ms",
+                F.when(F.col("window_n_rr_sum") > 0, F.col("rmssd_wsum") / F.col("window_n_rr_sum")),
+            )
+            .withColumn(
+                "pnn50",
+                F.when(F.col("window_n_rr_sum") > 0, F.col("pnn50_wsum") / F.col("window_n_rr_sum")),
+            )
+            .withColumn(
+                "valid_window_fraction",
+                F.when(F.col("window_count_total") > 0, F.col("window_count_valid") / F.col("window_count_total")),
+            )
+            .drop("mean_rr_wsum", "sdnn_wsum", "rmssd_wsum", "pnn50_wsum")
+        )
+
+        # Record-level rollups from RR series (distribution + irregularity).
+        rr_diffs = (
+            rr_df.filter(F.col("t_peak_sec").isNotNull())
+            .withColumn("diff_ms", F.col("rr_ms") - F.lag("rr_ms", 1).over(w_record))
+        )
+        rr_rollups = (
+            rr_df.groupBy("run_id", "run_date", "record_id")
+            .agg(
+                F.count(F.col("rr_ms")).alias("n_rr"),
+                F.min(F.col("rr_ms")).alias("rr_min_ms"),
+                F.max(F.col("rr_ms")).alias("rr_max_ms"),
+                F.expr(f"percentile_approx(rr_ms, 0.5, {PERCENTILE_APPROX_ACCURACY})").alias("rr_median_ms"),
+                F.expr(
+                    f"percentile_approx(rr_ms, 0.75, {PERCENTILE_APPROX_ACCURACY}) - "
+                    f"percentile_approx(rr_ms, 0.25, {PERCENTILE_APPROX_ACCURACY})"
+                ).alias("rr_iqr_ms"),
+            )
+            .withColumn("rr_range_ms", F.col("rr_max_ms") - F.col("rr_min_ms"))
+        )
+        drr_rollups = (
+            rr_diffs.groupBy("run_id", "run_date", "record_id")
+            .agg(
+                F.stddev_samp("diff_ms").alias("sdsd_ms"),
+                F.sum(F.when(F.abs(F.col("diff_ms")) > 20, F.lit(1)).otherwise(F.lit(0))).alias("pnn20_num"),
+                F.count(F.col("diff_ms")).alias("n_diff"),
+            )
+            .withColumn("pnn20", F.when(F.col("n_diff") > 0, F.col("pnn20_num") / F.col("n_diff")))
+            .drop("pnn20_num", "n_diff")
+        )
+        rr_features = rr_rollups.join(drr_rollups, ["run_id", "run_date", "record_id"], "left")
+
+        # Write curated dataset prefix per record (for records that are not skipped) and register curated artifacts.
         window_counts = {
             row["record_id"]: int(row["count"])
             for row in curated_df.groupBy("record_id").count().collect()
@@ -434,11 +561,115 @@ def main() -> int:
             log_structured(event="aggregation_spark_write_failed", run_id=run_id, error=str(e))
             return 1
 
-        n_ok = len(compute_ids)
+        # Build ml_ready record_features_v1 and enforce Gate C n_rr invariant.
+        ref_df = spark.createDataFrame(
+            [(run_id, run_date, rid) for rid in record_list],
+            ["run_id", "run_date", "record_id"],
+        )
+        ml_ready_df = (
+            ref_df.join(window_rollups, ["run_id", "run_date", "record_id"], "left")
+            .join(rr_features, ["run_id", "run_date", "record_id"], "left")
+        )
+        mismatch_rows = (
+            ml_ready_df.filter(F.coalesce(F.col("window_n_rr_sum"), F.lit(0)) != F.coalesce(F.col("n_rr"), F.lit(0)))
+            .select("record_id", "window_n_rr_sum", "n_rr")
+            .limit(5)
+            .collect()
+        )
+        if mismatch_rows:
+            sample = ";".join(
+                [f"{r['record_id']}:window_n_rr_sum={r['window_n_rr_sum']},n_rr={r['n_rr']}" for r in mismatch_rows]
+            )
+            upsert_service_run(
+                cur,
+                run_id,
+                status="failed",
+                notes=f"Gate C invariant failed: sum(window.n_rr) != n_rr ({sample})"[:500],
+                set_started=False,
+                set_ended=True,
+            )
+            conn.commit()
+            log_structured(event="aggregation_invariant_failed", run_id=run_id, detail=sample)
+            return 1
+
+        ml_ready_df = (
+            ml_ready_df
+            .withColumn(
+                "heart_rate_bpm",
+                F.when(F.col("mean_rr_ms") > 0, F.lit(60000.0) / F.col("mean_rr_ms")),
+            )
+            .withColumn(
+                "rr_cv",
+                F.when(F.col("mean_rr_ms") > 0, F.col("sdnn_ms") / F.col("mean_rr_ms")),
+            )
+            .withColumn(
+                "rmssd_sdnn_ratio",
+                F.when(F.col("sdnn_ms") > 0, F.col("rmssd_ms") / F.col("sdnn_ms")),
+            )
+            .withColumn("created_at", F.current_timestamp())
+            .select(
+                "run_id",
+                "run_date",
+                "record_id",
+                "mean_rr_ms",
+                "sdnn_ms",
+                "rmssd_ms",
+                "pnn50",
+                "n_rr",
+                "heart_rate_bpm",
+                "rr_cv",
+                "rmssd_sdnn_ratio",
+                "rr_min_ms",
+                "rr_max_ms",
+                "rr_range_ms",
+                "rr_median_ms",
+                "rr_iqr_ms",
+                "sdsd_ms",
+                "pnn20",
+                "mean_rr_window_std",
+                "sdnn_window_std",
+                "rmssd_window_std",
+                "window_count_total",
+                "window_count_valid",
+                "valid_window_fraction",
+                "mean_window_coverage_sec",
+                "min_window_coverage_sec",
+                "partial_window_fraction",
+                "created_at",
+            )
+        )
+        ml_ready_path = s3a_path(MINIO_BUCKET, ml_ready_key)
+        try:
+            ml_ready_df.write.mode("overwrite").parquet(ml_ready_path)
+            for record_id in record_list:
+                cur.execute(
+                    """
+                    INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, record_id, layer, artifact_type)
+                    DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
+                    """,
+                    (run_id, record_id, "ml_ready", "record_features_v1", ml_ready_key, "record_features_v1"),
+                )
+        except Exception as e:
+            exc_class = type(e).__name__
+            upsert_service_run(
+                cur,
+                run_id,
+                status="failed",
+                notes=f"Spark write failed: {exc_class}: {str(e)[:380]}",
+                set_started=False,
+                set_ended=True,
+            )
+            conn.commit()
+            log_structured(event="aggregation_spark_write_failed", run_id=run_id, error=str(e))
+            return 1
+
+        n_ok = len(record_list)
         notes = (
             f"records_total={len(record_list)},records_ok={n_ok},records_failed=0,"
             f"records_skipped={len(skipped_ids)},records_with_windows={len(records_with_windows)},"
-            f"windows_total={windows_total}"
+            f"windows_total={windows_total},ml_ready_rows={n_ok}"
         )
         upsert_service_run(cur, run_id, status="succeeded", notes=notes, set_started=False, set_ended=True)
         conn.commit()

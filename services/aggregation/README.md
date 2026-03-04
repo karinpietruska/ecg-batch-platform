@@ -103,6 +103,14 @@ Metric values are written as DOUBLE PRECISION without rounding; formatting/round
 
 `window_coverage_sec` measures observed R-peak span inside each 5-minute bin (`max(t_peak_sec) - min(t_peak_sec)`). Because R-peaks rarely align exactly with bin boundaries, coverage may be `< 300s` even for well-populated windows. Downstream consumers should apply a coverage threshold (for example `>=270s` or `>=290s`) rather than expecting exact `300s`.
 
+### ML-ready output semantics (`record_features_v1`)
+
+- Output path: `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/`.
+- The dataset has exactly one row per (`run_id`, `record_id`).
+- Canonical `n_rr` is RR-row count from processed `rr_intervals_v1` (`count(non-null rr_ms)`).
+- `pnn*` metrics are computed over successive differences (`diff_ms`) with denominator `n_diff` (count of non-null `diff_ms`); `n_diff` is internal and not exposed in `record_features_v1`.
+- Idempotency sentinel for Gate C is the ml_ready prefix: if it exists and `AGG_OVERWRITE=false`, aggregation skips both curated and ml_ready writes.
+
 ---
 
 ## Run lifecycle
