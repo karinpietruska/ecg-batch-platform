@@ -26,8 +26,12 @@ This service operates as a **CLI-first batch container** and is triggered by the
   - **Synthetic generator** (no external data required), or
   - **WFDB (MIT-BIH) files** from a mounted dataset directory.
 - Generate deterministic timestamps: `t_sec = sample_index / sampling_rate`
-- Write raw ECG data to MinIO as Parquet (`raw_ecg_v1` schema)
-- Register written artifacts in PostgreSQL (`artifacts` table, including `schema_ver`)
+- Write raw ECG data to MinIO as Parquet using the `raw_ecg_v1` schema.
+- Register written artifacts in the `artifacts` table with canonical metadata:
+  - `layer='raw'`
+  - `artifact_type='ecg'`
+  - `schema_ver='raw_ecg_v1'`
+  - `uri=<object key only, no scheme>`
 - Store basic quality metrics in PostgreSQL (`quality_metrics` table)
   - Sampling rate, number of samples, number of channels, annotation presence.
 - Implement storage-first idempotency (skip or overwrite per record)
@@ -56,6 +60,14 @@ Parquet schema (`raw_ecg_v1`):
 - `lead_1`
 
 Schema version is written to the metadata database as: **raw_ecg_v1**
+
+---
+
+### Determinism notes
+
+- `t_sec` is derived deterministically from `sample_index / sampling_rate`.
+- Sample ordering is preserved through `sample_index`.
+- Synthetic mode uses fixed sampling rate and deterministic signal generation for reproducible pipeline behavior.
 
 ---
 

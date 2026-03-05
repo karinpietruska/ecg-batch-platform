@@ -5,9 +5,8 @@
 ## Purpose
 
 The processing service reads raw ECG data from the `raw/` layer and writes
-RR-interval artifacts to the `processing/` layer in a way that mirrors the
-ingestion service: per-record idempotency, structured logging, and explicit
-service-level status in `service_runs`.
+RR-interval artifacts to the `processed/` layer with per-record idempotency,
+structured JSON logging, and lifecycle tracking in `service_runs`.
 
 It performs R-peak detection and RR-interval extraction using NeuroKit2
 (explicit method `pantompkins1985` for reproducibility) on **lead_0** only,
@@ -32,8 +31,12 @@ and stores per-record RR metrics in `processing_metrics`.
 - For each selected record:
   - Validate that the raw Parquet artifact is present and readable.
   - Compute R-peaks on `lead_0` and derive RR intervals.
-  - Write an `rr_intervals_v1` Parquet file to the `processing/` layer.
-  - Register the artifact in the `artifacts` table (`layer='processing'`).
+  - Write an `rr_intervals_v1` Parquet file to the `processed/` layer.
+  - Register the artifact in the `artifacts` table with canonical metadata:
+    - `layer='processed'`
+    - `artifact_type='rr_intervals_v1'`
+    - `schema_ver='rr_intervals_v1'`
+    - `uri=<object key only, no scheme>`
   - Upsert per-record metrics in `processing_metrics` (e.g. `n_beats`, `mean_rr_ms`, `sdnn_ms`).
 - Record a per-service lifecycle in `service_runs` for `service='processing'`.
 
@@ -44,20 +47,27 @@ and stores per-record RR metrics in `processing_metrics`.
 Processed object key format:
 
 ```
-processing/run_date=YYYY-MM-DD/run_id=<run_id>/record_id=<record_id>/rr_intervals.parquet
+processed/run_date=YYYY-MM-DD/run_id=<run_id>/record_id=<record_id>/rr_intervals_v1.parquet
 ```
 
 `rr_intervals_v1` Parquet schema (even when empty):
 
 - `run_id` (string)
-- `run_date` (string)
+- `run_date` (string, `YYYY-MM-DD`)
 - `record_id` (string)
 - `beat_index` (int64)
 - `peak_index` (int64)
 - `t_peak_sec` (float64)
 - `rr_interval_sec` (float64, nullable)
 
+If no peaks are detected for a record, the file is still written with this schema and contains 0 rows.
+
 Schema version written to the metadata database: **rr_intervals_v1**
+
+### Determinism notes
+
+- `t_peak_sec` is derived deterministically from peak index and sampling rate.
+- `beat_index` is monotonically increasing within each record and supports deterministic downstream ordering.
 
 ---
 
@@ -70,9 +80,18 @@ Schema version written to the metadata database: **rr_intervals_v1**
 
 **Infrastructure (usually from `.env` / compose):**
 
-- `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
-- `MINIO_ENDPOINT`, `MINIO_BUCKET`
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+PostgreSQL:
+- `POSTGRES_HOST`
+- `POSTGRES_PORT`
+- `POSTGRES_DB`
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+
+Object storage:
+- `MINIO_ENDPOINT`
+- `MINIO_BUCKET`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
 
 **Record selection:**
 
@@ -93,7 +112,7 @@ run is treated as a validation failure.
   - `false` (default): skip records whose processing artifact already exists.
   - `true`: overwrite existing processing artifacts and upsert DB metadata.
 
----
+--- 
 
 ## Idempotency
 
@@ -129,7 +148,7 @@ For each processing invocation:
 2. Record IDs are discovered from `artifacts` (layer `raw`, artifact_type `ecg`) for the given `run_id`.
 3. Optional filters (`RECORD_IDS` / `RECORD_RANGE` / `RECORD_LIMIT`) are applied: intersect with discovered set. If filters were provided and intersection is empty → validation failure; if no filters and no raw records → "nothing to do" success.
 4. Each record is processed independently:
-   - Idempotency check against object storage for the target `rr_intervals.parquet` key.
+   - Idempotency check against object storage for the target `rr_intervals_v1.parquet` key.
    - Download raw Parquet, compute RR intervals (NeuroKit2 on lead_0), write `rr_intervals_v1` Parquet.
    - Upsert `artifacts` and `processing_metrics` in PostgreSQL.
 5. After all records:

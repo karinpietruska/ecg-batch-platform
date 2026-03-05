@@ -36,9 +36,9 @@ tmp/
 local/
 
 # =====================================================
-# Documentation (entire docs/ untracked for now)
+# Documentation (only docs/internal untracked)
 # =====================================================
-docs/
+docs/internal
 
 
 # =====================================================
