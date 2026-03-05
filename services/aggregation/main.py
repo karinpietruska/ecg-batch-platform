@@ -7,6 +7,7 @@ curated artifacts.
 """
 import os
 import sys
+import json
 from datetime import UTC, datetime
 
 import boto3
@@ -50,6 +51,12 @@ def ml_ready_output_key(run_date: str, run_id: str) -> str:
 
 
 def log_structured(**kwargs):
+    payload = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "service": "aggregation",
+        **kwargs,
+    }
+    print(json.dumps(payload, sort_keys=True), flush=True)
     parts = [f"{k}={v!r}" for k, v in sorted(kwargs.items())]
     print(" ".join(parts), flush=True)
 

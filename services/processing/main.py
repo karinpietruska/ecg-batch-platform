@@ -6,6 +6,7 @@ writes rr_intervals_v1 artifacts, and records processing metrics.
 """
 import os
 import sys
+import json
 from datetime import UTC, datetime
 import tempfile
 
@@ -43,6 +44,12 @@ PROCESS_OVERWRITE = _OVERWRITE_RAW in ("1", "true", "yes", "y", "on")
 
 
 def log_structured(**kwargs):
+    payload = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "service": "processing",
+        **kwargs,
+    }
+    print(json.dumps(payload, sort_keys=True), flush=True)
     parts = [f"{k}={v!r}" for k, v in sorted(kwargs.items())]
     print(" ".join(parts), flush=True)
 

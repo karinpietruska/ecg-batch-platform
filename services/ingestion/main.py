@@ -6,7 +6,8 @@ idempotency; run status succeeded / partial_success / failed; fail-per-record.
 """
 import os
 import sys
-from datetime import datetime
+import json
+from datetime import UTC, datetime
 import tempfile
 
 import boto3
@@ -60,7 +61,13 @@ DEV_SLICE_SECONDS = _dev_sec if _dev_sec > 0 else None
 
 
 def log_structured(**kwargs):
-    """Minimal structured log (key=value)."""
+    """Emit structured JSON plus legacy key=value logs."""
+    payload = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "service": "ingestion",
+        **kwargs,
+    }
+    print(json.dumps(payload, sort_keys=True), flush=True)
     parts = [f"{k}={v!r}" for k, v in sorted(kwargs.items())]
     print(" ".join(parts), flush=True)
 
