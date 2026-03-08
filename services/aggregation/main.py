@@ -50,6 +50,11 @@ def ml_ready_output_key(run_date: str, run_id: str) -> str:
     return f"ml_ready/run_date={run_date}/run_id={run_id}/record_features_v1.parquet/"
 
 
+def ml_ready_window_output_key(run_date: str, run_id: str) -> str:
+    """Run-level ML-ready window output prefix."""
+    return f"ml_ready/run_date={run_date}/run_id={run_id}/window_features_ml_v1.parquet/"
+
+
 def log_structured(**kwargs):
     payload = {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -253,30 +258,63 @@ def main() -> int:
 
         s3_client = get_s3_client()
         ml_ready_key = ml_ready_output_key(run_date, run_id)
+        ml_ready_window_key = ml_ready_window_output_key(run_date, run_id)
+        record_features_exists = prefix_exists(s3_client, MINIO_BUCKET, ml_ready_key)
+        window_features_exists = prefix_exists(s3_client, MINIO_BUCKET, ml_ready_window_key)
 
-        # Gate C idempotency: if ml_ready output exists and overwrite=false, skip curated + ml_ready writes.
-        if prefix_exists(s3_client, MINIO_BUCKET, ml_ready_key) and not AGG_OVERWRITE:
-            upsert_service_run(
-                cur,
-                run_id,
-                status="succeeded",
-                notes="skipped; ml_ready output prefix already exists",
-                set_started=True,
-                set_ended=True,
-            )
-            conn.commit()
-            log_structured(
-                event="aggregation_skip",
-                run_id=run_id,
-                reason="object_exists",
-                scope="run",
-                target="ml_ready",
-            )
-            print(
-                "Skipped because ml_ready output prefix exists. If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
-                flush=True,
-            )
-            return 0
+        # Strict dual-output idempotency for AGG_OVERWRITE=false:
+        # - skip only if both outputs exist
+        # - fail fast on partial state (exactly one exists)
+        if not AGG_OVERWRITE:
+            if record_features_exists and window_features_exists:
+                upsert_service_run(
+                    cur,
+                    run_id,
+                    status="succeeded",
+                    notes="skipped; both ml_ready output prefixes already exist",
+                    set_started=True,
+                    set_ended=True,
+                )
+                conn.commit()
+                log_structured(
+                    event="aggregation_skip",
+                    run_id=run_id,
+                    reason="object_exists",
+                    scope="run",
+                    target="ml_ready_dual",
+                    record_features_exists=record_features_exists,
+                    window_features_exists=window_features_exists,
+                )
+                print(
+                    "Skipped because both ml_ready output prefixes exist. If this was a failed/partial output, rerun with AGG_OVERWRITE=1.",
+                    flush=True,
+                )
+                return 0
+            if record_features_exists != window_features_exists:
+                upsert_service_run(
+                    cur,
+                    run_id,
+                    status="failed",
+                    notes=(
+                        "partial ml_ready state detected: exactly one of "
+                        "record_features_v1/window_features_ml_v1 exists; rerun with AGG_OVERWRITE=1"
+                    ),
+                    set_started=True,
+                    set_ended=True,
+                )
+                conn.commit()
+                log_structured(
+                    event="aggregation_partial_ml_ready_state",
+                    run_id=run_id,
+                    record_features_exists=record_features_exists,
+                    window_features_exists=window_features_exists,
+                    agg_overwrite=AGG_OVERWRITE,
+                )
+                print(
+                    "Partial ml_ready state detected (only one output exists). Rerun with AGG_OVERWRITE=1.",
+                    flush=True,
+                )
+                return 1
 
         # Discover canonical processed RR artifacts
         candidates = discover_processing_artifacts(conn, run_id)
@@ -524,6 +562,41 @@ def main() -> int:
         )
         rr_features = rr_rollups.join(drr_rollups, ["run_id", "run_date", "record_id"], "left")
 
+        # Build ml_ready window_features_ml_v1 as curated projection + deterministic derived columns only.
+        window_ml_df = (
+            curated_df
+            .withColumn("window_start_sec", F.col("window_start_sec").cast("long"))
+            .withColumn(
+                "heart_rate_bpm",
+                F.when(F.col("mean_rr_ms") > 0, F.lit(60000.0) / F.col("mean_rr_ms")),
+            )
+            .withColumn(
+                "rr_cv",
+                F.when(F.col("mean_rr_ms") > 0, F.col("sdnn_ms") / F.col("mean_rr_ms")),
+            )
+            .withColumn(
+                "rmssd_sdnn_ratio",
+                F.when(F.col("sdnn_ms") > 0, F.col("rmssd_ms") / F.col("sdnn_ms")),
+            )
+            .select(
+                "run_id",
+                "run_date",
+                "record_id",
+                "window_start_sec",
+                "mean_rr_ms",
+                "sdnn_ms",
+                "rmssd_ms",
+                "pnn50",
+                "n_rr",
+                "heart_rate_bpm",
+                "rr_cv",
+                "rmssd_sdnn_ratio",
+                "window_valid",
+                "window_coverage_sec",
+                "window_is_partial",
+            )
+        )
+
         # Write curated dataset prefix per record (for records that are not skipped) and register curated artifacts.
         window_counts = {
             row["record_id"]: int(row["count"])
@@ -646,7 +719,19 @@ def main() -> int:
             )
         )
         ml_ready_path = s3a_path(MINIO_BUCKET, ml_ready_key)
+        ml_ready_window_path = s3a_path(MINIO_BUCKET, ml_ready_window_key)
         try:
+            window_ml_df.write.mode("overwrite").parquet(ml_ready_window_path)
+            for record_id in record_list:
+                cur.execute(
+                    """
+                    INSERT INTO artifacts (run_id, record_id, layer, artifact_type, uri, schema_ver)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, record_id, layer, artifact_type)
+                    DO UPDATE SET uri = EXCLUDED.uri, schema_ver = EXCLUDED.schema_ver, created_at = NOW()
+                    """,
+                    (run_id, record_id, "ml_ready", "window_features_ml_v1", ml_ready_window_key, "window_features_ml_v1"),
+                )
             ml_ready_df.write.mode("overwrite").parquet(ml_ready_path)
             for record_id in record_list:
                 cur.execute(
@@ -673,10 +758,11 @@ def main() -> int:
             return 1
 
         n_ok = len(record_list)
+        window_ml_rows = window_ml_df.count()
         notes = (
             f"records_total={len(record_list)},records_ok={n_ok},records_failed=0,"
             f"records_skipped={len(skipped_ids)},records_with_windows={len(records_with_windows)},"
-            f"windows_total={windows_total},ml_ready_rows={n_ok}"
+            f"windows_total={windows_total},ml_ready_window_rows={window_ml_rows},ml_ready_record_rows={n_ok}"
         )
         upsert_service_run(cur, run_id, status="succeeded", notes=notes, set_started=False, set_ended=True)
         conn.commit()
