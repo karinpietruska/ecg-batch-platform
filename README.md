@@ -1,16 +1,43 @@
-# ECG Batch Platform
+# ECG HRV Feature Pipeline
 
-Reproducible batch data pipeline for ECG processing, HRV feature engineering, and ML dataset preparation.
+Reproducible batch pipeline that converts ECG recordings into heart rate variability (HRV) features and produces machine-learning-ready feature datasets.
 
-This project converts raw ECG signals into canonical RR intervals, curated 5-minute HRV windows, and a record-level ML-ready feature table. The system is implemented as containerized services and can be executed either through the orchestrator script (recommended) or by running services manually in sequence.
+## Overview
 
-The canonical submission architecture is:
-- `raw` -> original ECG artifacts
-- `processed` -> `rr_intervals_v1`
-- `curated` -> `window_features_v1`
-- `ml_ready` -> `record_features_v1`
+This project processes ECG time-series data through a layered data pipeline:
 
-## Architecture Overview
+`raw ECG -> RR intervals -> HRV windows -> ML-ready feature datasets`
+
+The system ingests ECG recordings, performs R-peak detection and RR-interval extraction, computes 5-minute HRV statistics, and writes two ML-ready outputs: a primary window-level modeling table and a secondary record-level baseline table.
+
+The pipeline is implemented as containerized microservices and runs as a reproducible batch process using Docker.
+
+All datasets are stored as Parquet in an S3-compatible object store (MinIO) and registered in PostgreSQL metadata tables for lineage and discovery.
+
+## Project Goals
+
+This project demonstrates how to design a reproducible biomedical data pipeline with:
+
+- layered data architecture (`raw -> processed -> curated -> ml_ready`)
+- explicit data contracts and schema versioning
+- reproducible batch processing using containerized services
+- metadata-driven artifact tracking and lineage
+- contract tests that enforce pipeline invariants
+
+**Key capabilities**
+
+- Ingest ECG recordings from the MIT-BIH Arrhythmia Database (WFDB format)
+- Detect R-peaks and compute RR interval series
+- Generate 5-minute HRV feature windows
+- Produce ML-ready feature representations:
+  - window-level temporal features for sequence-aware modeling
+  - record-level aggregated baseline features
+- Track data lineage and artifacts via PostgreSQL metadata
+- Execute the pipeline reproducibly using containerized services
+
+**Stack:** Python · Apache Spark (PySpark) · Docker · MinIO · PostgreSQL
+
+## Pipeline Architecture
 
 [![ECG Pipeline Architecture](docs/architecture_diagram.png)](docs/architecture_diagram.png)
 
@@ -27,105 +54,266 @@ processing
    |
    v
 aggregation
-   ├─ curated/window_features_v1
-   └─ ml_ready/record_features_v1
+   ├─ curated/window_features_v1      (HRV windows)
+   ├─ ml_ready/window_features_ml_v1  (primary modeling dataset)
+   └─ ml_ready/record_features_v1     (record-level baseline)
 ```
+
+The window-level ML dataset (`window_features_ml_v1`) is the primary modeling representation because arrhythmia tasks operate on temporal segments rather than full-record aggregates.
 
 | Layer | Purpose |
 |---|---|
-| `raw` | Original ECG files |
-| `processed` | RR intervals derived from ECG |
-| `curated` | 5-minute HRV windows |
-| `ml_ready` | Record-level ML feature table |
-
-## Architecture Documentation
-
-Detailed architecture and system-level behavior are documented in:
-
-- `docs/ECG_PIPELINE_ARCHITECTURE_AND_DATA_CONTRACT.md`
-
-Canonical schemas, artifact naming rules, aggregation formulas, and invariants are defined in:
-
-- `docs/CANONICAL_DATA_CONTRACT.md`
-
-## Canonical Outputs
-
-Output object paths (MinIO/S3 style):
-
-- `processed/run_date=.../run_id=.../record_id=.../rr_intervals_v1.parquet`
-- `curated/run_date=.../run_id=.../record_id=.../window_features_v1.parquet/`
-- `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/`
+| `raw` | Original ECG waveform data |
+| `processed` | RR intervals extracted from ECG |
+| `curated` | 5-minute HRV feature windows |
+| `ml_ready` | Machine-learning-ready feature datasets (window-level temporal + record-level aggregate) |
 
 Canonical artifact names:
 - `rr_intervals_v1`
 - `window_features_v1`
+- `window_features_ml_v1`
 - `record_features_v1`
 
-Authoritative schemas, derivation rules, and invariants are defined in `docs/CANONICAL_DATA_CONTRACT.md`.
+## ML-Ready Outputs
 
-## Prerequisites
+The pipeline produces two complementary ML-ready datasets: a window-level temporal representation used for most modeling tasks, and a record-level aggregated baseline.
+Both datasets are derived from curated 5-minute HRV windows and registered as versioned artifacts in the metadata catalog.
 
-- Docker + Docker Compose
-- Linux/macOS shell
+### `window_features_ml_v1` (primary temporal representation)
 
-Initial setup:
+Path:
+
+`ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/`
+
+One row per 5-minute window (`run_id`, `record_id`, `window_start_sec`), preserving within-record temporal variation for arrhythmia-style and sequence-aware modeling.
+Row grain: (`run_id`, `record_id`, `window_start_sec`).
+
+### `record_features_v1` (secondary record-level baseline representation)
+
+Path:
+
+`ml_ready/run_date=.../run_id=.../record_features_v1.parquet/`
+
+Each row corresponds to one ECG record and contains aggregated HRV metrics derived from RR intervals.
+Row grain: (`run_id`, `record_id`).
+
+### Window-Level ML Features (`window_features_ml_v1`)
+These features describe HRV behavior within each 5-minute window.
+
+- `mean_rr_ms`
+- `sdnn_ms`
+- `rmssd_ms`
+- `pnn50`
+- `n_rr`
+- `heart_rate_bpm`
+- `rr_cv`
+- `rmssd_sdnn_ratio`
+- `window_valid`
+- `window_coverage_sec`
+- `window_is_partial`
+
+### Record-Level Aggregated Features (`record_features_v1`)
+These features summarize HRV statistics across all windows of a record.
+
+#### Core HRV Metrics
+
+- `mean_rr_ms`
+- `sdnn_ms`
+- `rmssd_ms`
+- `pnn50`
+
+#### Derived Cardiovascular Indicators
+
+- `heart_rate_bpm`
+- `rr_cv`
+- `rmssd_sdnn_ratio`
+
+#### RR Distribution Statistics
+
+- `rr_min_ms`
+- `rr_max_ms`
+- `rr_range_ms`
+- `rr_median_ms`
+- `rr_iqr_ms`
+
+#### Beat-to-Beat Irregularity Metrics
+
+- `sdsd_ms`
+- `pnn20`
+
+#### Temporal Stability Across Windows
+
+- `mean_rr_window_std`
+- `sdnn_window_std`
+- `rmssd_window_std`
+
+#### Data Quality and Coverage Indicators
+
+- `window_count_total`
+- `window_count_valid`
+- `valid_window_fraction`
+- `mean_window_coverage_sec`
+- `min_window_coverage_sec`
+- `partial_window_fraction`
+
+## Idempotency
+
+Aggregation enforces strict dual-output idempotency semantics when `AGG_OVERWRITE=false`:
+
+| State of ml_ready outputs | Behavior |
+|---|---|
+| both exist (`record_features_v1` and `window_features_ml_v1`) | skip |
+| none exist | run aggregation |
+| exactly one exists | fail (partial state) |
+
+This prevents inconsistent ML-ready states where only one of the two outputs exists.
+
+## Dataset Setup (MIT-BIH Arrhythmia Database)
+
+### Dataset Source
+
+This pipeline is designed to process ECG recordings from the MIT-BIH Arrhythmia Database:
+
+- [MIT-BIH Arrhythmia Database (PhysioNet)](https://physionet.org/content/mitdb/1.0.0/)
+
+The dataset contains 48 half-hour ambulatory ECG recordings sampled at 360 Hz and distributed in WFDB format.
+The ingestion service reads WFDB files (`.dat`, `.hea`, `.atr`) using the Python WFDB library.
+
+### Download the Dataset
+
+Download and extract the dataset from PhysioNet locally.  
+The full MIT-BIH dataset contains 48 recordings, but the pipeline can be tested with a small subset.  
+For an initial run, records `100`, `101`, and `102` are sufficient.
+
+### Place the Dataset in the Expected Directory
+
+Create the dataset folder:
+
+```bash
+mkdir -p data/mitdb
+```
+
+Place downloaded WFDB files inside:
+
+`data/mitdb/`
+
+Example structure:
+
+```text
+data/
+  mitdb/
+    100.dat
+    100.hea
+    100.atr
+    101.dat
+    101.hea
+    101.atr
+```
+
+Docker Compose mounts this directory into containers as:
+
+`/data/mitdb`
+
+## Environment Setup
+
+Requirements:
+- Docker
+- Docker Compose
+- Linux or macOS shell
+
+Initialize environment:
 
 ```bash
 cp .env.example .env
 docker compose up -d
 ```
 
-Default execution uses synthetic mode (`USE_SYNTHETIC_DATA=true`), which provides the fastest path for reviewers to run the pipeline locally. WFDB/MIT-BIH mode is optional.
+## Environment Check
 
-## Reviewer Quick Run
+Before running the pipeline, confirm infrastructure containers are running:
+
+```bash
+docker compose ps
+```
+
+Expected services:
+- `postgres`
+- `minio`
+
+If they are not running, start them with:
+
+```bash
+docker compose up -d
+```
+
+## Quick Start: Run the Pipeline on Real ECG Data
 
 Use one `RUN_ID`/`RUN_DATE` consistently across all stages.
+`RUN_ID` and `RUN_DATE` uniquely identify a pipeline execution and are used for dataset partitioning and metadata lineage.
 
-Recommended (orchestrator):
+Recommended first real-data run:
+- `USE_SYNTHETIC_DATA=false`
+- `RECORD_IDS=100,101,102`
+
+### Run via Orchestrator (Recommended)
 
 ```bash
-RUN_ID=review_demo_01 RUN_DATE=2026-03-04 ./scripts/run_orchestrator.sh
+RUN_ID=mitdb_demo_01 \
+RUN_DATE=2026-03-06 \
+USE_SYNTHETIC_DATA=false \
+RECORD_IDS=100,101,102 \
+./scripts/run_orchestrator.sh
 ```
 
-Manual fallback:
+### Manual Execution (Optional)
 
 ```bash
-RUN_ID=review_demo_01 RUN_DATE=2026-03-04 docker compose run --rm ingestion
-RUN_ID=review_demo_01 RUN_DATE=2026-03-04 docker compose run --rm processing
-RUN_ID=review_demo_01 RUN_DATE=2026-03-04 docker compose run --rm aggregation
+RUN_ID=mitdb_demo_01 RUN_DATE=2026-03-06 USE_SYNTHETIC_DATA=false RECORD_IDS=100,101,102 docker compose run --rm ingestion
+RUN_ID=mitdb_demo_01 RUN_DATE=2026-03-06 RECORD_IDS=100,101,102 docker compose run --rm processing
+RUN_ID=mitdb_demo_01 RUN_DATE=2026-03-06 RECORD_IDS=100,101,102 docker compose run --rm aggregation
 ```
-
-## Expected Outcomes
-
-| Stage | Output layer | artifact_type | Success signal |
-|---|---|---|---|
-| ingestion | `raw` | `ecg` | `runs.status='succeeded'` |
-| processing | `processed` | `rr_intervals_v1` | `service_runs(service='processing').status='succeeded'` |
-| aggregation | `curated` | `window_features_v1` | `service_runs(service='aggregation').status='succeeded'` + curated artifact rows |
-| aggregation | `ml_ready` | `record_features_v1` | ml_ready artifact rows + one row per record in dataset |
 
 ## Verify Results
 
-Run the two checks below after pipeline execution:
+### Check Service Execution
 
 ```bash
 docker compose exec postgres psql -U ecg -d ecg_metadata -c \
-"SELECT run_id, service, status, started_at IS NOT NULL AS has_started_at, ended_at IS NOT NULL AS has_ended_at FROM service_runs WHERE run_id='review_demo_01' ORDER BY service;"
+"SELECT run_id, status FROM runs WHERE run_id='mitdb_demo_01';"
 ```
 
 ```bash
 docker compose exec postgres psql -U ecg -d ecg_metadata -c \
-"SELECT layer, artifact_type, schema_ver, record_id, uri FROM artifacts WHERE run_id='review_demo_01' ORDER BY layer, record_id;"
+"SELECT run_id, service, status FROM service_runs WHERE run_id='mitdb_demo_01' ORDER BY service;"
 ```
 
-Expected artifact coverage:
+Expected successful statuses:
+- `runs.status -> succeeded` (ingestion)
+- `processing -> succeeded`
+- `aggregation -> succeeded`
+
+### Check Produced Artifacts
+
+```bash
+docker compose exec postgres psql -U ecg -d ecg_metadata -c \
+"SELECT layer, artifact_type, schema_ver, record_id FROM artifacts WHERE run_id='mitdb_demo_01' ORDER BY layer, record_id;"
+```
+
+Expected artifact coverage includes:
 - `processed / rr_intervals_v1`
 - `curated / window_features_v1`
+- `ml_ready / window_features_ml_v1`
 - `ml_ready / record_features_v1`
 
-## Contract Tests
+## Canonical Data Contracts
 
-Optional but recommended for reproducibility checks:
+Canonical schemas, derivation rules, and invariants:
+- `docs/CANONICAL_DATA_CONTRACT.md`
+
+System architecture and technical specification:
+- `docs/ECG_PIPELINE_ARCHITECTURE_AND_DATA_CONTRACT.md`
+
+## Contract Tests (Optional)
 
 ```bash
 ./scripts/contract_test_gate_a.sh
@@ -133,10 +321,17 @@ Optional but recommended for reproducibility checks:
 ./scripts/contract_test_gate_c.sh
 ```
 
-These validate:
-- Gate A: canonical processed RR artifacts and negative-path behavior
-- Gate B: curated window schema/semantics and idempotency
-- Gate C: ml_ready schema/semantics/invariants and idempotency sentinel
+These tests validate canonical artifact contracts, semantic checks, invariants, and idempotency behavior.
+
+## Synthetic Data Mode (Optional)
+
+Synthetic mode is available for quick smoke tests without downloading MIT-BIH data:
+
+```bash
+RUN_ID=synth_demo RUN_DATE=2026-03-06 ./scripts/run_orchestrator.sh
+```
+
+Synthetic mode is intended for rapid local testing; real ECG data should be used to assess semantic correctness of HRV feature computation.
 
 ## Repository Structure
 
@@ -145,11 +340,12 @@ docker-compose.yml
 .env.example
 
 services/
-  ingestion/
-  processing/
-  aggregation/
+  ingestion/      # WFDB ECG ingestion
+  processing/     # R-peak detection and RR interval extraction
+  aggregation/    # HRV window features and ML-ready datasets
 
 docs/
+  architecture_diagram.png
   ECG_PIPELINE_ARCHITECTURE_AND_DATA_CONTRACT.md
   CANONICAL_DATA_CONTRACT.md
 
@@ -162,8 +358,7 @@ scripts/
 
 ## Additional Documentation
 
+Service-specific implementation details:
 - `services/ingestion/README.md`
 - `services/processing/README.md`
 - `services/aggregation/README.md`
-
-Detailed implementation behavior, configuration nuances, and stage-specific failure modes are documented in these service READMEs.

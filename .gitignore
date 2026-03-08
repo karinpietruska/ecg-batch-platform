@@ -25,7 +25,7 @@ env/
 Thumbs.db
 
 # =====================================================
-# Dataset (local MIT-BIH download; mount into ingestion)
+# Dataset (local MIT-BIH download)
 # =====================================================
 data/
 
@@ -36,7 +36,7 @@ tmp/
 local/
 
 # =====================================================
-# Documentation (only docs/internal untracked)
+# Documentation
 # =====================================================
 docs/internal
 
@@ -48,7 +48,7 @@ scripts/plausibility_check_b1.sh
 
 
 # =====================================================
-# Cursor (AI editor) files
+# Cursor files
 # =====================================================
 .cursor/
 .cursor-cache/

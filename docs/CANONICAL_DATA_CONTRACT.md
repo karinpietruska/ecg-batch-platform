@@ -28,19 +28,19 @@ If wording differs across documents, the definitions in this file take precedenc
 
 ---
 
-## 0.1) Phase 0 decision lock (pending implementation)
+## 0.1) Decision lock (implemented)
 
-The following decisions are locked for the next extension cycle and are intentionally documented before code changes:
+The following decisions are implemented and locked for this contract version:
 
-- `ml_ready/window_features_ml_v1` will be the **primary temporal representation** for modeling tasks that depend on within-record temporal variation.
+- `ml_ready/window_features_ml_v1` is the **primary temporal representation** for modeling tasks that depend on within-record temporal variation.
 - `ml_ready/record_features_v1` remains the **secondary record-level baseline representation** for tabular summary modeling.
 
-Strict dual-output idempotency policy (for `AGG_OVERWRITE=false`) is locked as:
+Strict dual-output idempotency policy (for `AGG_OVERWRITE=false`) is:
 
 - Skip aggregation writes only when **both** ml_ready outputs exist for the run.
 - If exactly one ml_ready output exists (partial ml_ready state), aggregation must fail fast (non-zero exit) with an explicit partial-state error and recovery path (`AGG_OVERWRITE=true`).
 
-This section is a design lock for implementation phases and does not imply the new artifact is already produced by the current codebase.
+This section codifies current implemented behavior.
 
 ---
 
@@ -113,12 +113,12 @@ Note: Spark outputs are written as directory prefixes containing part files; non
   - `schema_ver='record_features_v1'`
   - `uri=<object key only, no scheme>`
 
-## 2.4 ML-ready layer: window-level modeling table (`window_features_ml_v1`) (Phase 1 schema lock)
+## 2.4 ML-ready layer: window-level modeling table (`window_features_ml_v1`)
 
-- **Path (target):** `ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/`
-- **Write form (target):** Spark dataset prefix (directory containing part files)
-- **Row grain / key guarantee (target):** primary key is (`run_id`, `record_id`, `window_start_sec`)
-- **Artifact row (target):**
+- **Path:** `ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/`
+- **Write form:** Spark dataset prefix (directory containing part files)
+- **Row grain / key guarantee:** primary key is (`run_id`, `record_id`, `window_start_sec`)
+- **Artifact row:**
   - `layer='ml_ready'`
   - `artifact_type='window_features_ml_v1'`
   - `schema_ver='window_features_ml_v1'`
@@ -143,7 +143,7 @@ Derived column safety guards (required):
 - `rr_cv = sdnn_ms / mean_rr_ms` if `mean_rr_ms > 0`, else `NULL`
 - `rmssd_sdnn_ratio = rmssd_ms / sdnn_ms` if `sdnn_ms > 0`, else `NULL`
 
-Phase 1 implementation constraint (low-risk extension):
+v1 implementation constraint:
 
 - `window_features_ml_v1` MUST be a projection of canonical curated `window_features_v1`
   plus deterministic derived columns only.

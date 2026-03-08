@@ -7,7 +7,7 @@ This system implements a reproducible batch pipeline for ECG feature engineering
 Pipeline stages:
 - `ingestion` -> `raw`
 - `processing` -> `processed/rr_intervals_v1`
-- `aggregation` -> `curated/window_features_v1`, `ml_ready/record_features_v1`, and (contract extension target) `ml_ready/window_features_ml_v1`
+- `aggregation` -> `curated/window_features_v1`, `ml_ready/record_features_v1`, and `ml_ready/window_features_ml_v1`
 
 Deterministic timestamps and deterministic windowing rules are used to support reproducibility across reruns.
 
@@ -114,7 +114,7 @@ Flattened record-level ML table containing:
 
 Full column lists and formulas are defined in `docs/CANONICAL_DATA_CONTRACT.md`.
 
-### 7.4 `window_features_ml_v1` (contract extension target)
+### 7.4 `window_features_ml_v1`
 Window-level ML table with one row per (`run_id`, `record_id`, `window_start_sec`), derived from curated window features plus deterministic derived columns (`heart_rate_bpm`, `rr_cv`, `rmssd_sdnn_ratio`) using denominator safety guards.
 
 Intended use:
@@ -128,7 +128,7 @@ Aggregation service behavior:
 - Assigns 5-minute windows via deterministic bucketing.
 - Computes window metrics in curated output.
 - Computes record-level rollups in ML-ready output.
-- Writes (extension target) window-level ML-ready representation by projecting curated windows and adding deterministic derived columns.
+- Writes window-level ML-ready representation by projecting curated windows and adding deterministic derived columns.
 
 Key semantic points:
 - 5-minute windowing uses `window_start_sec = floor(t_peak_sec / 300) * 300`.
