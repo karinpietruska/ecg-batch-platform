@@ -61,18 +61,17 @@ aggregation
 
 The window-level ML dataset (`window_features_ml_v1`) is the primary modeling representation because arrhythmia tasks operate on temporal segments rather than full-record aggregates.
 
-| Layer | Purpose |
+| Data stage | Purpose |
 |---|---|
 | `raw` | Original ECG waveform data |
 | `processed` | RR intervals extracted from ECG |
 | `curated` | 5-minute HRV feature windows |
 | `ml_ready` | Machine-learning-ready feature datasets (window-level temporal + record-level aggregate) |
 
-Canonical artifact names:
-- `rr_intervals_v1`
-- `window_features_v1`
-- `window_features_ml_v1`
-- `record_features_v1`
+Canonical artifacts by data stage:
+- `processed`: `rr_intervals_v1`
+- `curated`: `window_features_v1`
+- `ml_ready`: `window_features_ml_v1` (primary), `record_features_v1` (secondary)
 
 ## ML-Ready Outputs
 
@@ -187,11 +186,13 @@ For an initial run, records `100`, `101`, and `102` are sufficient.
 
 ### Place the Dataset in the Expected Directory
 
-Create the dataset folder:
+From the repository root (`ecg-batch-platform/`), create the dataset folder:
 
 ```bash
 mkdir -p data/mitdb
 ```
+
+This command creates `data/mitdb/` relative to the repository root.
 
 Place downloaded WFDB files inside:
 
@@ -305,6 +306,20 @@ Expected artifact coverage includes:
 - `ml_ready / window_features_ml_v1`
 - `ml_ready / record_features_v1`
 
+### Inspect Primary ML-Ready Output
+
+To inspect the primary modeling dataset (`ml_ready/window_features_ml_v1`) for the demo run:
+
+```bash
+docker compose run --rm processing python scripts/preview_window_ml.py \
+  --run-id mitdb_demo_01 \
+  --run-date 2026-03-06 \
+  --record-id 100 \
+  --limit 3
+```
+
+This prints the first up to 3 windows for the selected record (for example `window_start_sec = 0, 300, 600` when available).
+
 ## Canonical Data Contracts
 
 Canonical schemas, derivation rules, and invariants:
@@ -351,6 +366,7 @@ docs/
 
 scripts/
   run_orchestrator.sh
+  preview_window_ml.py
   contract_test_gate_a.sh
   contract_test_gate_b.sh
   contract_test_gate_c.sh

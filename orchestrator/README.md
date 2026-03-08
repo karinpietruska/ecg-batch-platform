@@ -83,7 +83,7 @@ In production, the orchestrator is typically invoked by a scheduler (host cron, 
 Example **host cron** entry (daily at 02:00, using UTC date by default):
 
 ```cron
-0 2 * * * cd /home/karin/projects/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
+0 2 * * * cd /path/to/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
 ```
 
 `scripts/scheduled_orchestrator.sh`:
@@ -97,7 +97,7 @@ Example **host cron** entry (daily at 02:00, using UTC date by default):
 You can override record selection or overwrite flags by setting env vars in the cron entry, e.g.:
 
 ```cron
-0 2 * * * cd /home/karin/projects/ecg-batch-platform && RECORD_RANGE=100-124 RECORD_LIMIT=10 ./scripts/scheduled_orchestrator.sh
+0 2 * * * cd /path/to/ecg-batch-platform && RECORD_RANGE=100-124 RECORD_LIMIT=10 ./scripts/scheduled_orchestrator.sh
 ```
 
 ---

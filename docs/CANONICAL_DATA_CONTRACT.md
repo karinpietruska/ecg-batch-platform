@@ -3,8 +3,8 @@
 This document defines the canonical dataset schemas, artifact naming conventions,
 derivation rules, and invariants used by the ECG batch processing pipeline.
 
-It specifies how data is written to the processed, curated, and ml_ready layers
-of the data lake and how downstream services discover and interpret these datasets.
+It specifies the authoritative data contract for datasets written to the
+processed, curated, and ml_ready stages of the data lake.
 
 Related documentation:
 - Architecture overview: `docs/ECG_PIPELINE_ARCHITECTURE_AND_DATA_CONTRACT.md`
@@ -28,7 +28,7 @@ If wording differs across documents, the definitions in this file take precedenc
 
 ---
 
-## 0.1) Decision lock (implemented)
+## 0.1) Contract decisions (implemented)
 
 The following decisions are implemented and locked for this contract version:
 
@@ -37,7 +37,7 @@ The following decisions are implemented and locked for this contract version:
 
 Strict dual-output idempotency policy (for `AGG_OVERWRITE=false`) is:
 
-- Skip aggregation writes only when **both** ml_ready outputs exist for the run.
+- Skip aggregation writes only when **both** ml_ready output prefixes exist for the run.
 - If exactly one ml_ready output exists (partial ml_ready state), aggregation must fail fast (non-zero exit) with an explicit partial-state error and recovery path (`AGG_OVERWRITE=true`).
 
 This section codifies current implemented behavior.
@@ -71,13 +71,18 @@ Version is encoded in `artifact_type` and mirrored in `schema_ver` (required by 
 
 Rule:
 
-- `schema_ver` MUST equal `artifact_type` for canonical writes.
+- For canonical writes, `schema_ver` MUST equal `artifact_type`.
 
 ---
 
 ## 2) Path + metadata contract
 
 Note: Spark outputs are written as directory prefixes containing part files; non-Spark services may write a single Parquet object.
+
+Definition: Row grain
+
+Row grain defines the level of detail represented by a single row in a dataset
+and is typically expressed as the set of columns that uniquely identify a row.
 
 ## 2.1 Processed layer: RR intervals (`rr_intervals_v1`)
 
@@ -234,7 +239,7 @@ This strict rule prevents silent skips on incomplete ml_ready output state.
 
 ---
 
-## 4) Non-negotiable invariants
+## 4) Canonical invariants
 
 - Deterministic window assignment: `window_start_sec = floor(t_peak_sec / 300) * 300`
 - `window_start_sec` is treated as integer-second bucket start relative to record start (`0, 300, 600, ...`).
