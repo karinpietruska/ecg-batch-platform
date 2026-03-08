@@ -177,6 +177,7 @@ This pipeline is designed to process ECG recordings from the MIT-BIH Arrhythmia 
 
 The dataset contains 48 half-hour ambulatory ECG recordings sampled at 360 Hz and distributed in WFDB format.
 The ingestion service reads WFDB files (`.dat`, `.hea`, `.atr`) using the Python WFDB library.
+Some records include extra archival annotation variants (for example `102-0.atr`); the pipeline uses the standard record basename triplet (`<record>.dat`, `<record>.hea`, `<record>.atr`) and ignores extra variants.
 
 ### Download the Dataset
 
@@ -278,10 +279,14 @@ RUN_ID=mitdb_demo_01 RUN_DATE=2026-03-06 RECORD_IDS=100,101,102 docker compose r
 
 ### Check Service Execution
 
+Check ingestion run status (`runs` table):
+
 ```bash
 docker compose exec postgres psql -U ecg -d ecg_metadata -c \
 "SELECT run_id, status FROM runs WHERE run_id='mitdb_demo_01';"
 ```
+
+Check processing and aggregation service status (`service_runs` table):
 
 ```bash
 docker compose exec postgres psql -U ecg -d ecg_metadata -c \
@@ -289,7 +294,7 @@ docker compose exec postgres psql -U ecg -d ecg_metadata -c \
 ```
 
 Expected successful statuses:
-- `runs.status -> succeeded` (ingestion)
+- `runs.status -> succeeded` (ingestion status in `runs`)
 - `processing -> succeeded`
 - `aggregation -> succeeded`
 
