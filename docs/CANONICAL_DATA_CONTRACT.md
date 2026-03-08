@@ -28,6 +28,22 @@ If wording differs across documents, the definitions in this file take precedenc
 
 ---
 
+## 0.1) Phase 0 decision lock (pending implementation)
+
+The following decisions are locked for the next extension cycle and are intentionally documented before code changes:
+
+- `ml_ready/window_features_ml_v1` will be the **primary temporal representation** for modeling tasks that depend on within-record temporal variation.
+- `ml_ready/record_features_v1` remains the **secondary record-level baseline representation** for tabular summary modeling.
+
+Strict dual-output idempotency policy (for `AGG_OVERWRITE=false`) is locked as:
+
+- Skip aggregation writes only when **both** ml_ready outputs exist for the run.
+- If exactly one ml_ready output exists (partial ml_ready state), aggregation must fail fast (non-zero exit) with an explicit partial-state error and recovery path (`AGG_OVERWRITE=true`).
+
+This section is a design lock for implementation phases and does not imply the new artifact is already produced by the current codebase.
+
+---
+
 ## 1) Canonical naming (authoritative)
 
 ### 1.1 Data lake prefixes
@@ -50,6 +66,7 @@ Version is encoded in `artifact_type` and mirrored in `schema_ver` (required by 
 
 - `rr_intervals_v1`
 - `window_features_v1`
+- `window_features_ml_v1`
 - `record_features_v1`
 
 Rule:
@@ -89,11 +106,49 @@ Note: Spark outputs are written as directory prefixes containing part files; non
 - **Path:** `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/`
 - **Write form:** Spark dataset prefix (directory containing part files)
 - **Partitioning intent:** run-level dataset; one row per (`run_id`, `record_id`)
+- **Row grain / key guarantee:** primary key is (`run_id`, `record_id`)
 - **Artifact row:**
   - `layer='ml_ready'`
   - `artifact_type='record_features_v1'`
   - `schema_ver='record_features_v1'`
   - `uri=<object key only, no scheme>`
+
+## 2.4 ML-ready layer: window-level modeling table (`window_features_ml_v1`) (Phase 1 schema lock)
+
+- **Path (target):** `ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/`
+- **Write form (target):** Spark dataset prefix (directory containing part files)
+- **Row grain / key guarantee (target):** primary key is (`run_id`, `record_id`, `window_start_sec`)
+- **Artifact row (target):**
+  - `layer='ml_ready'`
+  - `artifact_type='window_features_ml_v1'`
+  - `schema_ver='window_features_ml_v1'`
+  - `uri=<object key only, no scheme>`
+
+`window_start_sec` semantics:
+
+- Integer seconds relative to record start.
+- Represents the canonical 5-minute bin start (`0, 300, 600, ...`) for the window.
+- Must be consistent with deterministic assignment rule in section 4.
+
+Required columns (frozen for v1):
+
+- **Identifiers:** `run_id`, `run_date`, `record_id`, `window_start_sec`
+- **Core HRV (preserved from curated):** `mean_rr_ms`, `sdnn_ms`, `rmssd_ms`, `pnn50`, `n_rr`
+- **Derived (added in ml_ready):** `heart_rate_bpm`, `rr_cv`, `rmssd_sdnn_ratio`
+- **Quality (preserved from curated):** `window_valid`, `window_coverage_sec`, `window_is_partial`
+
+Derived column safety guards (required):
+
+- `heart_rate_bpm = 60000 / mean_rr_ms` if `mean_rr_ms > 0`, else `NULL`
+- `rr_cv = sdnn_ms / mean_rr_ms` if `mean_rr_ms > 0`, else `NULL`
+- `rmssd_sdnn_ratio = rmssd_ms / sdnn_ms` if `sdnn_ms > 0`, else `NULL`
+
+Phase 1 implementation constraint (low-risk extension):
+
+- `window_features_ml_v1` MUST be a projection of canonical curated `window_features_v1`
+  plus deterministic derived columns only.
+- It MUST NOT recompute RR metrics, alter window boundaries, or redefine curated metric validity rules.
+- Curated remains the authority for metric validity (`sdnn_ms`, `rmssd_ms`, `pnn50`, `window_valid`, etc.); ml_ready preserves those fields.
 
 ### `record_features_v1` canonical columns
 
@@ -152,9 +207,37 @@ If no canonical processed RR artifacts exist for the `run_id`, aggregation MUST 
 
 ---
 
+## 3.1) Dual ml_ready idempotency semantics (strict partial-state failure)
+
+For `AGG_OVERWRITE=false`, aggregation idempotency across ml_ready outputs is defined as:
+
+- **Skip case:** aggregation skips curated + ml_ready writes only when both ml_ready prefixes exist for the run:
+  - `ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/`
+  - `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/`
+- **Proceed case:** if neither ml_ready prefix exists, aggregation proceeds normally.
+- **Partial-state failure case:** if exactly one ml_ready prefix exists, aggregation MUST fail fast.
+
+Partial-state failure requirements:
+
+- Exit code MUST be `1`.
+- Structured log event MUST be emitted with:
+  - `event='aggregation_partial_ml_ready_state'`
+  - `run_id`
+  - `record_features_exists` (boolean)
+  - `window_features_exists` (boolean)
+  - `agg_overwrite` (boolean/string flag value)
+- `service_runs.status` MUST be `failed`.
+- `service_runs.notes` MUST explain partial ml_ready state (one output exists, the other missing).
+- Recovery path MUST be documented and surfaced in logs: rerun with `AGG_OVERWRITE=true`.
+
+This strict rule prevents silent skips on incomplete ml_ready output state.
+
+---
+
 ## 4) Non-negotiable invariants
 
 - Deterministic window assignment: `window_start_sec = floor(t_peak_sec / 300) * 300`
+- `window_start_sec` is treated as integer-second bucket start relative to record start (`0, 300, 600, ...`).
 - `t_peak_sec` is the R-peak time in seconds (derived deterministically from sample index and sampling rate), stored in `rr_intervals_v1`
 - Each RR row corresponds to a beat; `t_peak_sec` is the timestamp of that beat's R-peak (the beat that terminates the RR interval)
 - `MIN_RR_PER_WINDOW = 30` (v1 constant)

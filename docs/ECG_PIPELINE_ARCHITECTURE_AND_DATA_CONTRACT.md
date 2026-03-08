@@ -2,12 +2,12 @@
 
 ## 1) System Overview
 
-This system implements a reproducible batch pipeline for ECG feature engineering and machine learning preparation. It ingests ECG waveform data (MIT-BIH/WFDB or synthetic mode), derives RR interval series, computes 5-minute HRV windows, and produces flattened record-level ML features.
+This system implements a reproducible batch pipeline for ECG feature engineering and machine learning preparation. It ingests ECG waveform data (MIT-BIH/WFDB or synthetic mode), derives RR interval series, computes 5-minute HRV windows, and produces ML-ready features at different row grains.
 
 Pipeline stages:
 - `ingestion` -> `raw`
 - `processing` -> `processed/rr_intervals_v1`
-- `aggregation` -> `curated/window_features_v1` and `ml_ready/record_features_v1`
+- `aggregation` -> `curated/window_features_v1`, `ml_ready/record_features_v1`, and (contract extension target) `ml_ready/window_features_ml_v1`
 
 Deterministic timestamps and deterministic windowing rules are used to support reproducibility across reruns.
 
@@ -38,6 +38,7 @@ processing
       v
 aggregation
    ├─ curated/window_features_v1
+   ├─ ml_ready/window_features_ml_v1
    └─ ml_ready/record_features_v1
 ```
 
@@ -56,7 +57,7 @@ Microservice boundaries are explicit: each service owns its stage and communicat
 | `raw` | Original ECG waveform data | `raw/run_date=.../run_id=.../record_id=.../ecg.parquet` |
 | `processed` | RR intervals extracted from ECG | `processed/run_date=.../run_id=.../record_id=.../rr_intervals_v1.parquet` |
 | `curated` | 5-minute window HRV features | `curated/run_date=.../run_id=.../record_id=.../window_features_v1.parquet/` |
-| `ml_ready` | Record-level ML features | `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/` |
+| `ml_ready` | ML-ready feature representations | `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/` and `ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/` |
 
 Notes:
 - Partitioning is explicit in object keys (`run_date`, `run_id`, `record_id` where applicable).
@@ -86,6 +87,7 @@ Discovery pattern:
 Canonical versioned artifacts:
 - `rr_intervals_v1`
 - `window_features_v1`
+- `window_features_ml_v1`
 - `record_features_v1`
 
 Versioning rule:
@@ -112,6 +114,13 @@ Flattened record-level ML table containing:
 
 Full column lists and formulas are defined in `docs/CANONICAL_DATA_CONTRACT.md`.
 
+### 7.4 `window_features_ml_v1` (contract extension target)
+Window-level ML table with one row per (`run_id`, `record_id`, `window_start_sec`), derived from curated window features plus deterministic derived columns (`heart_rate_bpm`, `rr_cv`, `rmssd_sdnn_ratio`) using denominator safety guards.
+
+Intended use:
+- primary temporal representation for arrhythmia-style and temporally sensitive modeling
+- direct alignment with 5-minute window semantics
+
 ## 8) Aggregation Semantics
 
 Aggregation service behavior:
@@ -119,6 +128,7 @@ Aggregation service behavior:
 - Assigns 5-minute windows via deterministic bucketing.
 - Computes window metrics in curated output.
 - Computes record-level rollups in ML-ready output.
+- Writes (extension target) window-level ML-ready representation by projecting curated windows and adding deterministic derived columns.
 
 Key semantic points:
 - 5-minute windowing uses `window_start_sec = floor(t_peak_sec / 300) * 300`.
@@ -145,7 +155,9 @@ Overwrite controls:
 
 Idempotency model:
 - Object storage existence checks determine whether datasets are skipped or recomputed.
-- Aggregation uses the existence of the ml_ready dataset prefix as a run-level idempotency sentinel when overwrite is disabled.
+- For dual ml_ready outputs, strict idempotency semantics are defined in the canonical contract:
+  - skip only when both ml_ready outputs exist
+  - fail fast on partial ml_ready state when overwrite is disabled
 
 Reproducibility is supported by:
 - deterministic processing rules
