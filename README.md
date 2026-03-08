@@ -10,7 +10,7 @@ This project processes ECG time-series data through a layered data pipeline:
 
 The system ingests ECG recordings, performs R-peak detection and RR-interval extraction, computes 5-minute HRV statistics, and writes two ML-ready outputs: a primary window-level modeling table and a secondary record-level baseline table.
 
-The pipeline is implemented as containerized microservices and runs as a reproducible batch process using Docker.
+The pipeline is implemented as a containerized microservice architecture. Individual services handle ingestion, signal processing, and feature aggregation, and communicate through shared storage layers. The system runs as a reproducible batch pipeline using Docker and Docker Compose.
 
 All datasets are stored as Parquet in an S3-compatible object store (MinIO) and registered in PostgreSQL metadata tables for lineage and discovery.
 
@@ -24,6 +24,40 @@ This project demonstrates how to design a reproducible biomedical data pipeline 
 - metadata-driven artifact tracking and lineage
 - contract tests that enforce pipeline invariants
 
+## System Properties
+
+The architecture is designed to satisfy key data engineering requirements for data-intensive systems.
+
+**Reliability**
+
+- Batch runs are orchestrated using a deterministic pipeline runner (`run_orchestrator.sh`).
+- Artifact idempotency rules prevent partial outputs in the `ml_ready` layer.
+- Pipeline stages fail fast if required inputs or outputs are missing.
+
+**Scalability**
+
+- Processing is implemented using Apache Spark (PySpark), enabling distributed computation if the pipeline is deployed on a cluster.
+- Data artifacts are stored in partitioned Parquet datasets within S3-compatible object storage (MinIO).
+- The architecture separates ingestion, processing, and aggregation services, allowing independent scaling.
+
+**Maintainability**
+
+- The pipeline follows a staged, service-based data architecture (`raw -> processed -> curated -> ml_ready`).
+- Canonical artifact schemas and invariants are defined in explicit data contracts.
+- Each pipeline stage is implemented as an isolated containerized service.
+
+**Reproducibility**
+
+- The full environment is defined via Docker Compose.
+- All artifacts are versioned by `run_id` and `run_date`.
+- Code and configuration are tracked in a Git repository.
+
+**Data Governance and Lineage**
+
+- All produced datasets are registered in PostgreSQL metadata tables.
+- Artifact metadata records the layer, artifact type, schema version, and originating run.
+- This enables lineage tracing from ML-ready datasets back to the original input records.
+
 **Key capabilities**
 
 - Ingest ECG recordings from the MIT-BIH Arrhythmia Database (WFDB format)
@@ -35,9 +69,9 @@ This project demonstrates how to design a reproducible biomedical data pipeline 
 - Track data lineage and artifacts via PostgreSQL metadata
 - Execute the pipeline reproducibly using containerized services
 
-**Stack:** Python · Apache Spark (PySpark) · Docker · MinIO · PostgreSQL
+**Technologies used:** Python · Apache Spark (PySpark) · Docker · MinIO · PostgreSQL
 
-## Pipeline Architecture
+## Data Pipeline Architecture
 
 [![ECG Pipeline Architecture](docs/architecture_diagram.png)](docs/architecture_diagram.png)
 
@@ -223,6 +257,9 @@ Requirements:
 - Docker Compose
 - Linux or macOS shell
 
+Optional (host-side utilities outside Docker):
+- Python 3.11+
+
 Initialize environment:
 
 ```bash
@@ -266,6 +303,17 @@ USE_SYNTHETIC_DATA=false \
 RECORD_IDS=100,101,102 \
 ./scripts/run_orchestrator.sh
 ```
+
+### Scheduled Execution (Example: Weekly)
+
+For production-style operation, the pipeline orchestrator can be scheduled via a host-level scheduler such as cron.
+Example (weekly, Sunday 02:00 UTC):
+
+```cron
+0 2 * * 0 cd /path/to/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
+```
+
+This project includes `scripts/scheduled_orchestrator.sh`. Scheduling cadence is configured externally (cron, CI/CD scheduler, or workflow runner) rather than inside the pipeline itself.
 
 ### Manual Execution (Optional)
 
@@ -376,6 +424,17 @@ scripts/
   contract_test_gate_b.sh
   contract_test_gate_c.sh
 ```
+
+## Potential Production Scaling
+
+Although the current system is deployed locally using Docker Compose, the architecture is designed to scale to production environments.
+
+In a production setting, the microservices could be deployed on a container orchestration platform such as Kubernetes.
+MinIO could be replaced with a managed object storage system (for example AWS S3 or Azure Blob Storage), and PostgreSQL could run as a managed metadata service.
+The processing layer implemented with PySpark could execute on a distributed Spark cluster to process significantly larger ECG datasets.
+Workflow orchestration could be handled by a scheduler such as Apache Airflow or a cloud-native workflow engine.
+
+These changes would allow the same architectural principles to scale to larger datasets and distributed compute environments while preserving the reproducible batch processing design.
 
 ## Additional Documentation
 

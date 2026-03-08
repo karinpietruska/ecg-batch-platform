@@ -3,7 +3,7 @@
 # Intended to be called by cron or a CI scheduler.
 #
 # Example cron entry (daily at 02:00 UTC):
-#   0 2 * * * cd /home/karin/projects/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
+#   0 2 * * * cd /path/to/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
 
 set -euo pipefail
 
