@@ -226,7 +226,7 @@ if [[ "$SECOND_EXIT" -ne 0 ]]; then
   exit 1
 fi
 
-if ! grep -Eq "aggregation_skip_record|All selected records skipped because curated output prefixes exist|target='ml_ready'|Skipped because ml_ready output prefix exists" "$SECOND_LOG"; then
+if ! grep -Eq "aggregation_skip_record|All selected records skipped because curated output prefixes exist|target='ml_ready_dual'|Skipped because both ml_ready output prefixes exist" "$SECOND_LOG"; then
   echo "FAIL: second aggregation run did not emit expected skip indicator"
   rm -f "$SECOND_LOG"
   exit 1

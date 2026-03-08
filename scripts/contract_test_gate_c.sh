@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Gate C contract test:
 # - Produces processed -> curated -> ml_ready for one record.
-# - Verifies canonical ml_ready artifact metadata.
+# - Verifies canonical ml_ready artifact metadata (record + window-level extension).
 # - Verifies record_features_v1 schema + semantic checks.
+# - Verifies window_features_ml_v1 schema + semantic/parity checks.
 # - Verifies n_rr invariant: sum(window_features_v1.n_rr) == ml_ready.n_rr == processed rr row count.
-# - Verifies Gate C idempotency: second run with AGG_OVERWRITE=false skips on ml_ready prefix.
+# - Verifies strict dual-output idempotency:
+#     * second run skips only when both ml_ready outputs exist
+#     * partial ml_ready state fails fast with explicit event.
 
 set -euo pipefail
 
@@ -35,14 +38,14 @@ RUN_ID="$RUN_ID" RUN_DATE="$RUN_DATE" RECORD_IDS="$RECORD_ID" docker compose run
 RUN_ID="$RUN_ID" RUN_DATE="$RUN_DATE" RECORD_IDS="$RECORD_ID" AGG_OVERWRITE=true docker compose run --rm aggregation
 
 echo
-echo "=== 1.1) Verify canonical ml_ready artifact row exists ==="
+echo "=== 1.1) Verify canonical ml_ready artifact rows exist ==="
 docker compose exec postgres psql -U ecg -d ecg_metadata -c "
 SELECT layer, artifact_type, schema_ver, record_id, uri
 FROM artifacts
 WHERE run_id = '$RUN_ID'
   AND layer = 'ml_ready'
-  AND artifact_type = 'record_features_v1'
-  AND schema_ver = 'record_features_v1'
+  AND artifact_type IN ('record_features_v1', 'window_features_ml_v1')
+  AND schema_ver IN ('record_features_v1', 'window_features_ml_v1')
 ORDER BY record_id;"
 
 ML_READY_URI=$(docker compose exec -T postgres psql -U ecg -d ecg_metadata -t -A -c "
@@ -52,6 +55,16 @@ WHERE run_id = '$RUN_ID'
   AND layer = 'ml_ready'
   AND artifact_type = 'record_features_v1'
   AND schema_ver = 'record_features_v1'
+  AND record_id = '$RECORD_ID'
+LIMIT 1;")
+
+WINDOW_ML_URI=$(docker compose exec -T postgres psql -U ecg -d ecg_metadata -t -A -c "
+SELECT uri
+FROM artifacts
+WHERE run_id = '$RUN_ID'
+  AND layer = 'ml_ready'
+  AND artifact_type = 'window_features_ml_v1'
+  AND schema_ver = 'window_features_ml_v1'
   AND record_id = '$RECORD_ID'
 LIMIT 1;")
 
@@ -76,25 +89,29 @@ WHERE run_id = '$RUN_ID'
 LIMIT 1;")
 
 ML_READY_URI="${ML_READY_URI//[$'\r\n']}"
+WINDOW_ML_URI="${WINDOW_ML_URI//[$'\r\n']}"
 CURATED_URI="${CURATED_URI//[$'\r\n']}"
 PROCESSED_URI="${PROCESSED_URI//[$'\r\n']}"
 
-if [[ -z "$ML_READY_URI" || -z "$CURATED_URI" || -z "$PROCESSED_URI" ]]; then
+if [[ -z "$ML_READY_URI" || -z "$WINDOW_ML_URI" || -z "$CURATED_URI" || -z "$PROCESSED_URI" ]]; then
   echo "FAIL: missing one or more canonical URIs"
   echo "ML_READY_URI=$ML_READY_URI"
+  echo "WINDOW_ML_URI=$WINDOW_ML_URI"
   echo "CURATED_URI=$CURATED_URI"
   echo "PROCESSED_URI=$PROCESSED_URI"
   exit 1
 fi
 
 echo "ML_READY_URI=$ML_READY_URI"
+echo "WINDOW_ML_URI=$WINDOW_ML_URI"
 echo "CURATED_URI=$CURATED_URI"
 echo "PROCESSED_URI=$PROCESSED_URI"
 
 echo
-echo "=== 2) Validate record_features_v1 schema + semantics + invariants ==="
+echo "=== 2) Validate record_features_v1 + window_features_ml_v1 schema/semantics/invariants ==="
 docker compose run --rm \
   -e ML_READY_URI="$ML_READY_URI" \
+  -e WINDOW_ML_URI="$WINDOW_ML_URI" \
   -e CURATED_URI="$CURATED_URI" \
   -e PROCESSED_URI="$PROCESSED_URI" \
   -e RUN_ID="$RUN_ID" \
@@ -110,6 +127,7 @@ import pyarrow.parquet as pq
 endpoint = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
 bucket = os.environ.get("MINIO_BUCKET", "ecg-datalake")
 ml_ready_uri = os.environ["ML_READY_URI"]
+window_ml_uri = os.environ["WINDOW_ML_URI"]
 curated_uri = os.environ["CURATED_URI"]
 processed_uri = os.environ["PROCESSED_URI"]
 run_id = os.environ["RUN_ID"]
@@ -153,6 +171,13 @@ required_cols = {
     "created_at",
 }
 
+window_required_cols = {
+    "run_id", "run_date", "record_id", "window_start_sec",
+    "mean_rr_ms", "sdnn_ms", "rmssd_ms", "pnn50", "n_rr",
+    "heart_rate_bpm", "rr_cv", "rmssd_sdnn_ratio",
+    "window_valid", "window_coverage_sec", "window_is_partial",
+}
+
 ml_keys = list_parquet(ml_ready_uri)
 if not ml_keys:
     raise SystemExit(f"FAIL: no ml_ready parquet files under {ml_ready_uri}")
@@ -170,6 +195,63 @@ target = [r for r in rows if str(r["run_id"]) == run_id and str(r["record_id"]) 
 if len(target) != 1:
     raise SystemExit(f"FAIL: expected exactly one ml_ready row for run_id/record_id, got {len(target)}")
 r = target[0]
+
+# Validate window_features_ml_v1 dataset.
+window_keys = list_parquet(window_ml_uri)
+if not window_keys:
+    raise SystemExit(f"FAIL: no window ml_ready parquet files under {window_ml_uri}")
+
+window_rows = []
+for key in window_keys:
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    t = pq.read_table(pa.BufferReader(obj["Body"].read()))
+    missing = sorted([c for c in window_required_cols if c not in t.schema.names])
+    if missing:
+        raise SystemExit(f"FAIL: window_features_ml_v1 missing required columns: {missing}")
+    window_rows.extend(t.to_pylist())
+
+window_target = [w for w in window_rows if str(w["run_id"]) == run_id and str(w["record_id"]) == record_id]
+if not window_target:
+    raise SystemExit("FAIL: expected at least one window_features_ml_v1 row for run_id/record_id")
+
+window_key_set = set()
+for w in window_target:
+    ws = w.get("window_start_sec")
+    if ws is None:
+        raise SystemExit("FAIL: window_features_ml_v1 window_start_sec is NULL")
+    k = (str(w["run_id"]), str(w["record_id"]), int(ws))
+    if k in window_key_set:
+        raise SystemExit(f"FAIL: duplicate window_features_ml_v1 key: {k}")
+    window_key_set.add(k)
+    # pnn50 bounds
+    p50 = w.get("pnn50")
+    if p50 is not None:
+        p50f = float(p50)
+        if p50f < 0.0 or p50f > 1.0:
+            raise SystemExit(f"FAIL: window_features_ml_v1 pnn50 out of [0,1]: {p50f}")
+    # Derived guards + correctness
+    mean_rr_w = w.get("mean_rr_ms")
+    sdnn_w = w.get("sdnn_ms")
+    hr_w = w.get("heart_rate_bpm")
+    rr_cv_w = w.get("rr_cv")
+    ratio_w = w.get("rmssd_sdnn_ratio")
+    if mean_rr_w is None or float(mean_rr_w) <= 0:
+        if hr_w is not None:
+            raise SystemExit("FAIL: window heart_rate_bpm must be NULL when mean_rr_ms <= 0")
+        if rr_cv_w is not None:
+            raise SystemExit("FAIL: window rr_cv must be NULL when mean_rr_ms <= 0")
+    else:
+        expected_hr = 60000.0 / float(mean_rr_w)
+        if hr_w is None or not math.isfinite(float(hr_w)) or abs(float(hr_w) - expected_hr) > 1e-6:
+            raise SystemExit("FAIL: window heart_rate_bpm formula/finite check failed")
+        if rr_cv_w is not None and not math.isfinite(float(rr_cv_w)):
+            raise SystemExit("FAIL: window rr_cv must be finite when mean_rr_ms > 0")
+    if sdnn_w is None or float(sdnn_w) <= 0:
+        if ratio_w is not None:
+            raise SystemExit("FAIL: window rmssd_sdnn_ratio must be NULL when sdnn_ms <= 0")
+    else:
+        if ratio_w is not None and not math.isfinite(float(ratio_w)):
+            raise SystemExit("FAIL: window rmssd_sdnn_ratio must be finite when sdnn_ms > 0")
 
 def check_fraction(name):
     v = r.get(name)
@@ -235,6 +317,7 @@ curated_keys = list_parquet(curated_uri)
 if not curated_keys:
     raise SystemExit(f"FAIL: no curated parquet files under {curated_uri}")
 sum_window_n_rr = 0
+curated_key_set = set()
 for key in curated_keys:
     obj = s3.get_object(Bucket=bucket, Key=key)
     t = pq.read_table(pa.BufferReader(obj["Body"].read()))
@@ -246,6 +329,17 @@ for key in curated_keys:
             vv = v.as_py()
             if vv is not None:
                 sum_window_n_rr += int(vv)
+    rid = t.column("record_id")
+    ws = t.column("window_start_sec")
+    run_col = t.column("run_id")
+    for i in range(t.num_rows):
+        rv = rid[i].as_py()
+        wsv = ws[i].as_py()
+        runv = run_col[i].as_py()
+        if rv is None or wsv is None or runv is None:
+            continue
+        if str(rv) == record_id and str(runv) == run_id:
+            curated_key_set.add((str(runv), str(rv), int(wsv)))
 
 obj = s3.get_object(Bucket=bucket, Key=processed_uri)
 rr_table = pq.read_table(pa.BufferReader(obj["Body"].read()))
@@ -270,21 +364,29 @@ if processed_n_rr != ml_n_rr:
         f"({processed_n_rr} != {ml_n_rr})"
     )
 
+# Window parity invariant: window_features_ml_v1 keys match curated keys for this run/record.
+if curated_key_set != window_key_set:
+    raise SystemExit(
+        f"FAIL: window key parity mismatch curated vs window_features_ml_v1 "
+        f"(curated={len(curated_key_set)} window_ml={len(window_key_set)})"
+    )
+
 print(
     "PASS: Gate C schema/semantic checks passed "
-    f"(ml_ready_rows={len(target)}, ml_n_rr={ml_n_rr}, sum_window_n_rr={sum_window_n_rr})"
+    f"(record_rows={len(target)}, window_rows={len(window_target)}, "
+    f"ml_n_rr={ml_n_rr}, sum_window_n_rr={sum_window_n_rr})"
 )
 PY
 
 echo
-echo "=== 3) Idempotency check: second run with AGG_OVERWRITE=false skips on ml_ready ==="
+echo "=== 3) Idempotency check: second run with AGG_OVERWRITE=false skips on dual ml_ready ==="
 ML_READY_COUNT_BEFORE=$(docker compose exec -T postgres psql -U ecg -d ecg_metadata -t -A -c "
 SELECT COUNT(*)
 FROM artifacts
 WHERE run_id = '$RUN_ID'
   AND layer = 'ml_ready'
-  AND artifact_type = 'record_features_v1'
-  AND schema_ver = 'record_features_v1';")
+  AND artifact_type IN ('record_features_v1','window_features_ml_v1')
+  AND schema_ver IN ('record_features_v1','window_features_ml_v1');")
 ML_READY_COUNT_BEFORE="${ML_READY_COUNT_BEFORE//[$'\r\n ']}"
 
 SECOND_LOG="$(mktemp)"
@@ -297,7 +399,7 @@ if [[ "$SECOND_EXIT" -ne 0 ]]; then
   echo "FAIL: second aggregation run failed with exit code $SECOND_EXIT (expected 0)"
   exit 1
 fi
-if ! grep -Eq "target='ml_ready'|Skipped because ml_ready output prefix exists" "$SECOND_LOG"; then
+if ! grep -Eq "target='ml_ready_dual'|Skipped because both ml_ready output prefixes exist" "$SECOND_LOG"; then
   echo "FAIL: second run did not emit expected ml_ready skip indicator"
   rm -f "$SECOND_LOG"
   exit 1
@@ -308,8 +410,8 @@ SELECT COUNT(*)
 FROM artifacts
 WHERE run_id = '$RUN_ID'
   AND layer = 'ml_ready'
-  AND artifact_type = 'record_features_v1'
-  AND schema_ver = 'record_features_v1';")
+  AND artifact_type IN ('record_features_v1','window_features_ml_v1')
+  AND schema_ver IN ('record_features_v1','window_features_ml_v1');")
 ML_READY_COUNT_AFTER="${ML_READY_COUNT_AFTER//[$'\r\n ']}"
 if [[ "$ML_READY_COUNT_AFTER" != "$ML_READY_COUNT_BEFORE" ]]; then
   echo "FAIL: ml_ready artifact count changed on skip run (before=$ML_READY_COUNT_BEFORE after=$ML_READY_COUNT_AFTER)"
@@ -318,6 +420,141 @@ if [[ "$ML_READY_COUNT_AFTER" != "$ML_READY_COUNT_BEFORE" ]]; then
 fi
 
 rm -f "$SECOND_LOG"
+
+echo
+echo "=== 4) Strict partial-state check: one ml_ready output missing should fail ==="
+docker compose run --rm \
+  -e WINDOW_ML_URI="$WINDOW_ML_URI" \
+  processing python - <<'PY'
+import os
+import boto3
+
+endpoint = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
+bucket = os.environ.get("MINIO_BUCKET", "ecg-datalake")
+prefix = os.environ["WINDOW_ML_URI"]
+ak = os.environ.get("AWS_ACCESS_KEY_ID")
+sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+if not ak or not sk:
+    raise SystemExit("FAIL: missing AWS credentials")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint,
+    aws_access_key_id=ak,
+    aws_secret_access_key=sk,
+)
+
+token = None
+deleted = 0
+while True:
+    kwargs = {"Bucket": bucket, "Prefix": prefix}
+    if token:
+        kwargs["ContinuationToken"] = token
+    resp = s3.list_objects_v2(**kwargs)
+    objs = [{"Key": o["Key"]} for o in resp.get("Contents", [])]
+    if objs:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+        deleted += len(objs)
+    if not resp.get("IsTruncated"):
+        break
+    token = resp.get("NextContinuationToken")
+
+print(f"Deleted {deleted} objects under {prefix}")
+PY
+
+PARTIAL_LOG="$(mktemp)"
+set +e
+RUN_ID="$RUN_ID" RUN_DATE="$RUN_DATE" RECORD_IDS="$RECORD_ID" AGG_OVERWRITE=false docker compose run --rm aggregation | tee "$PARTIAL_LOG"
+PARTIAL_EXIT="${PIPESTATUS[0]}"
+set -e
+
+if [[ "$PARTIAL_EXIT" -eq 0 ]]; then
+  echo "FAIL: partial-state run exited 0 (expected failure exit 1)"
+  rm -f "$PARTIAL_LOG"
+  exit 1
+fi
+if ! grep -Eq "aggregation_partial_ml_ready_state" "$PARTIAL_LOG"; then
+  echo "FAIL: partial-state run did not emit expected aggregation_partial_ml_ready_state event"
+  rm -f "$PARTIAL_LOG"
+  exit 1
+fi
+
+PARTIAL_STATUS=$(docker compose exec -T postgres psql -U ecg -d ecg_metadata -t -A -c "
+SELECT status
+FROM service_runs
+WHERE run_id = '$RUN_ID' AND service='aggregation'
+ORDER BY ended_at DESC
+LIMIT 1;")
+PARTIAL_STATUS="${PARTIAL_STATUS//[$'\r\n ']}"
+if [[ "$PARTIAL_STATUS" != "failed" ]]; then
+  echo "FAIL: expected service_runs.status=failed after partial-state run, got '$PARTIAL_STATUS'"
+  rm -f "$PARTIAL_LOG"
+  exit 1
+fi
+
+rm -f "$PARTIAL_LOG"
+
+echo
+echo "=== 5) Cleanup disposable Gate C test run artifacts/metadata ==="
+docker compose run --rm \
+  -e RUN_ID="$RUN_ID" \
+  -e RUN_DATE="$RUN_DATE" \
+  processing python - <<'PY'
+import os
+import boto3
+
+endpoint = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
+bucket = os.environ.get("MINIO_BUCKET", "ecg-datalake")
+run_id = os.environ["RUN_ID"]
+run_date = os.environ["RUN_DATE"]
+ak = os.environ.get("AWS_ACCESS_KEY_ID")
+sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+if not ak or not sk:
+    raise SystemExit("FAIL: missing AWS credentials")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint,
+    aws_access_key_id=ak,
+    aws_secret_access_key=sk,
+)
+
+prefixes = [
+    f"raw/run_date={run_date}/run_id={run_id}/",
+    f"processed/run_date={run_date}/run_id={run_id}/",
+    f"curated/run_date={run_date}/run_id={run_id}/",
+    f"ml_ready/run_date={run_date}/run_id={run_id}/",
+]
+
+deleted = 0
+for prefix in prefixes:
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        objs = [{"Key": o["Key"]} for o in resp.get("Contents", [])]
+        if objs:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+            deleted += len(objs)
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+
+print(f"Cleanup deleted {deleted} objects for run_id={run_id}")
+PY
+
+docker compose exec -T postgres psql -U ecg -d ecg_metadata -c "
+DELETE FROM processing_metrics WHERE run_id = '$RUN_ID';
+DELETE FROM features_metrics WHERE run_id = '$RUN_ID';
+DELETE FROM quality_metrics WHERE run_id = '$RUN_ID';
+DELETE FROM artifacts WHERE run_id = '$RUN_ID';
+DELETE FROM service_runs WHERE run_id = '$RUN_ID';
+DELETE FROM runs WHERE run_id = '$RUN_ID';
+"
 
 echo
 echo "Gate C contract test passed."
