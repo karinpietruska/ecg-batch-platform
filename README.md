@@ -31,7 +31,7 @@ The architecture is designed to satisfy key data engineering requirements for da
 **Reliability**
 
 - Batch runs are orchestrated using a deterministic pipeline runner (`run_orchestrator.sh`).
-- Artifact idempotency rules prevent partial outputs in the `ml_ready` layer.
+- Artifact idempotency rules and fail-fast checks reduce the risk of partial outputs in the `ml_ready` layer.
 - Pipeline stages fail fast if required inputs or outputs are missing.
 
 **Scalability**
@@ -52,11 +52,23 @@ The architecture is designed to satisfy key data engineering requirements for da
 - All artifacts are versioned by `run_id` and `run_date`.
 - Code and configuration are tracked in a Git repository.
 
+**Data Security**
+
+- Services run in isolated Docker containers and communicate only through controlled storage layers.
+- In local deployment, MinIO and PostgreSQL are containerized services with network access controlled by deployment configuration.
+- Credentials and configuration are managed through environment variables defined in the deployment environment.
+
 **Data Governance and Lineage**
 
 - All produced datasets are registered in PostgreSQL metadata tables.
 - Artifact metadata records the layer, artifact type, schema version, and originating run.
 - This enables lineage tracing from ML-ready datasets back to the original input records.
+
+**Data Protection**
+
+- The pipeline processes publicly available ECG research data from the MIT-BIH Arrhythmia Database.
+- No personally identifiable information (PII) is processed or stored.
+- Data processing therefore operates within a non-personal biomedical research context.
 
 **Key capabilities**
 
