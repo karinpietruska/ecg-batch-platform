@@ -28,7 +28,7 @@ It is a CLI-first batch container (PySpark + S3A/MinIO) using structured JSON lo
 Each row is one 5-minute bin with HRV metrics and quality fields including `window_valid`, `window_coverage_sec`, and `window_is_partial`.
 Row grain: (run_id, record_id, window_start_sec).
 
-### ML-ready (`record_features_v1`)
+### ML-ready (`record_features_v1`) (secondary record-level baseline)
 
 - Path pattern: `ml_ready/run_date=.../run_id=.../record_features_v1.parquet/`
 - Artifact row:
@@ -40,7 +40,7 @@ Row grain: (run_id, record_id, window_start_sec).
 The dataset contains exactly one row per (`run_id`, `record_id`) within a run.
 Row grain: (run_id, record_id).
 
-### ML-ready (`window_features_ml_v1`)
+### ML-ready (`window_features_ml_v1`) (primary temporal representation)
 
 - Path pattern: `ml_ready/run_date=.../run_id=.../window_features_ml_v1.parquet/`
 - Artifact row:

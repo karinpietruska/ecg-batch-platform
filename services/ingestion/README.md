@@ -6,7 +6,7 @@
 
 The ingestion service is responsible for loading ECG time-series data and writing it to the `raw/` layer of the data lake in a reproducible and traceable manner.
 
-This service operates as a **CLI-first batch container** and is triggered by the orchestrator with a specific `run_id` and `run_date`.
+This service operates as a **CLI-first batch container** and is typically triggered by the orchestrator with a specific `run_id` and `run_date`, but it can also be run manually.
 
 ---
 
@@ -221,7 +221,6 @@ The ingestion service has been validated with:
 
 ## Status
 
-This service is part of a staged implementation approach.  
-It is operational once the storage layer and metadata database are available and
+This service is operational once the storage layer and metadata database are available and
 the ingestion container image has been built. Orchestration (e.g. scheduled runs)
 is handled by higher-level components.

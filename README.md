@@ -107,6 +107,17 @@ aggregation
 
 The window-level ML dataset (`window_features_ml_v1`) is the primary modeling representation because arrhythmia tasks operate on temporal segments rather than full-record aggregates.
 
+### Microservices
+
+- **Ingestion Service**: loads ECG records and writes `raw` artifacts plus ingestion metadata.
+- **Processing Service**: performs R-peak detection, computes RR intervals, and writes `processed/rr_intervals_v1`.
+- **Aggregation Service**: computes 5-minute HRV windows in `curated/window_features_v1` and produces ML-ready outputs in `ml_ready`.
+
+### Storage Services
+
+- **PostgreSQL**: stores run metadata, service lifecycle state, and artifact lineage records.
+- **MinIO**: stores Parquet artifacts across `raw`, `processed`, `curated`, and `ml_ready`.
+
 | Data stage | Purpose |
 |---|---|
 | `raw` | Original ECG waveform data |
@@ -324,6 +335,8 @@ Example (weekly, Sunday 02:00 UTC):
 ```cron
 0 2 * * 0 cd /path/to/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
 ```
+
+In practice, batch pipelines are typically triggered by an external scheduler (for example cron, a CI/CD workflow, or an orchestration platform such as Airflow). This project demonstrates the execution pattern using a cron example while keeping the pipeline itself scheduler-independent.
 
 This project includes `scripts/scheduled_orchestrator.sh`. Scheduling cadence is configured externally (cron, CI/CD scheduler, or workflow runner) rather than inside the pipeline itself.
 
