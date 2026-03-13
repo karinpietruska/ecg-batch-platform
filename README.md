@@ -336,9 +336,10 @@ Example (weekly, Sunday 02:00 UTC):
 0 2 * * 0 cd /path/to/ecg-batch-platform && ./scripts/scheduled_orchestrator.sh
 ```
 
+This project includes `scripts/scheduled_orchestrator.sh`. Scheduling cadence is configured externally (cron, CI/CD scheduler, or workflow runner) rather than inside the pipeline itself.
+
 In practice, batch pipelines are typically triggered by an external scheduler (for example cron, a CI/CD workflow, or an orchestration platform such as Airflow). This project demonstrates the execution pattern using a cron example while keeping the pipeline itself scheduler-independent.
 
-This project includes `scripts/scheduled_orchestrator.sh`. Scheduling cadence is configured externally (cron, CI/CD scheduler, or workflow runner) rather than inside the pipeline itself.
 
 ### Manual Execution (Optional)
 

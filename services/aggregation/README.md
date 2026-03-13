@@ -1,6 +1,6 @@
 # Aggregation Service
 
-**Layer – Feature engineering and ML-ready dataset construction (Spark)**
+**Layer 1 – Feature engineering and ML-ready dataset construction (Spark)**
 
 ## Purpose
 
